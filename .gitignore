@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Generated data: calibration results, logs, camera frames, rendered videos.
+# Camera frames can show people in the lab, so never commit outputs/.
+outputs/
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/

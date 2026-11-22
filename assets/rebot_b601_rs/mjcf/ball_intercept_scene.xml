@@ -1,0 +1,98 @@
+<!--
+  Ball-intercept scene for the Seeed reBot Arm B601-RS.
+
+  World frame: origin at the arm base, z = 0 is the tabletop.
+  The arm sits at the -x end of the table; the ball is launched from the
+  +x end and rolls toward the arm (-x). The arm holds its gripper open,
+  pointing down, with the two fingers spread along y, so a ball that is
+  rolling along x can pass between them.
+
+  This file must stay next to rs_arm.xml: meshdir="../meshes" is resolved
+  relative to the top-level model file.
+-->
+<mujoco model="rebot_rs_ball_intercept">
+  <include file="rs_arm.xml"/>
+  <compiler angle="radian" meshdir="../meshes"/>
+
+  <option timestep="0.001" iterations="100" solver="Newton" integrator="implicitfast"/>
+
+  <!-- Same self-collision excludes as Seeed's rs_grasp_scene.xml. -->
+  <contact>
+    <exclude body1="world" body2="link1"/>
+    <exclude body1="base_link" body2="link1"/>
+    <exclude body1="link1" body2="link2"/>
+    <exclude body1="link2" body2="link3"/>
+    <exclude body1="link2" body2="link5"/>
+    <exclude body1="link3" body2="link4"/>
+    <exclude body1="link3" body2="link5"/>
+    <exclude body1="link4" body2="link5"/>
+    <exclude body1="link5" body2="link6"/>
+  </contact>
+
+  <statistic center="0.45 0 0.1" extent="0.9"/>
+
+  <visual>
+    <global azimuth="150" elevation="-25" offwidth="1920" offheight="1080"/>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0.1 0.1 0.1"/>
+    <quality shadowsize="4096"/>
+    <rgba haze="0.15 0.22 0.30 1"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.30 0.48 0.65" rgb2="0.04 0.06 0.08" width="512" height="3072"/>
+    <texture type="2d" name="floor_tex" builtin="checker" mark="edge" rgb1="0.22 0.28 0.31"
+             rgb2="0.10 0.14 0.16" markrgb="0.72 0.78 0.80" width="300" height="300"/>
+    <material name="floor_mat" texture="floor_tex" texuniform="true" texrepeat="6 6" reflectance="0.1"/>
+    <texture type="2d" name="table_tex" builtin="checker" rgb1="0.80 0.74 0.62" rgb2="0.76 0.70 0.58"
+             width="200" height="200"/>
+    <material name="table_mat" texture="table_tex" texuniform="true" texrepeat="8 8" reflectance="0.05"/>
+    <material name="leg_mat" rgba="0.25 0.25 0.27 1"/>
+    <material name="ball_mat" rgba="0.95 0.35 0.05 1" specular="0.4" shininess="0.6"/>
+    <material name="line_mat" rgba="1 1 1 0.6"/>
+    <material name="launch_mat" rgba="0.1 0.6 1.0 0.7"/>
+  </asset>
+
+  <worldbody>
+    <light name="key" pos="0.6 -0.6 1.6" dir="-0.2 0.4 -1" directional="false" castshadow="true"
+           diffuse="0.7 0.7 0.7" attenuation="1 0 0"/>
+    <light name="fill" pos="-0.5 0.8 1.4" dir="0.3 -0.5 -1" directional="true" castshadow="false"
+           diffuse="0.3 0.3 0.3"/>
+
+    <geom name="floor" type="plane" pos="0 0 -0.75" size="3 3 0.05" material="floor_mat"/>
+
+    <!-- Table: top surface at z = 0, x in [-0.15, 1.05], y in [-0.35, 0.35]. -->
+    <body name="table" pos="0.45 0 -0.015">
+      <geom name="tabletop" type="box" size="0.60 0.35 0.015" material="table_mat"
+            friction="0.8 0.005 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001"/>
+      <geom type="box" pos=" 0.56  0.31 -0.375" size="0.025 0.025 0.36" material="leg_mat"/>
+      <geom type="box" pos=" 0.56 -0.31 -0.375" size="0.025 0.025 0.36" material="leg_mat"/>
+      <geom type="box" pos="-0.56  0.31 -0.375" size="0.025 0.025 0.36" material="leg_mat"/>
+      <geom type="box" pos="-0.56 -0.31 -0.375" size="0.025 0.025 0.36" material="leg_mat"/>
+      <!-- Low side rails keep stray balls on the table. -->
+      <geom name="rail_left"  type="box" pos="0  0.345 0.025" size="0.60 0.005 0.010" material="leg_mat"/>
+      <geom name="rail_right" type="box" pos="0 -0.345 0.025" size="0.60 0.005 0.010" material="leg_mat"/>
+      <geom name="rail_back"  type="box" pos="-0.595 0 0.025" size="0.005 0.35 0.010" material="leg_mat"/>
+    </body>
+
+    <!-- Visual markers (no collision): launch line and intercept line. -->
+    <geom name="launch_line" type="box" pos="0.95 0 0.0005" size="0.003 0.33 0.0005"
+          material="launch_mat" contype="0" conaffinity="0"/>
+    <geom name="intercept_line" type="box" pos="0.32 0 0.0005" size="0.002 0.33 0.0005"
+          material="line_mat" contype="0" conaffinity="0"/>
+
+    <!-- Ball: 4.4 cm diameter, ~45 g (rubber-ish). Initial pose/velocity set in Python. -->
+    <body name="ball" pos="0.95 0 0.022">
+      <freejoint name="ball_free"/>
+      <geom name="ball_geom" type="sphere" size="0.022" mass="0.045" material="ball_mat"
+            condim="6" friction="0.8 0.005 0.0001" solref="0.004 1" solimp="0.95 0.99 0.001"/>
+    </body>
+
+    <!-- Cameras. -->
+    <camera name="overview" mode="fixed" pos="1.45 -0.78 0.72" xyaxes="0.561 0.828 0 -0.337 0.229 0.913" fovy="45"/>
+    <camera name="topdown" mode="fixed" pos="0.45 0 1.25" xyaxes="1 0 0 0 1 0" fovy="45"/>
+    <!-- External "real-world" tracking camera: fixed on a stand at the side of the table, 1.25 m up,
+         sees the whole tabletop. Used by eaiproject/ball_tracker.py (classic colour-blob tracking). -->
+    <camera name="ext_cam" mode="fixed" pos="0.45 -0.55 1.25" xyaxes="1 0 0 0 0.915 0.403" fovy="45"/>
+    <camera name="gate_view" mode="fixed" pos="0.72 0 0.17" xyaxes="0 1 0 -0.330 0 0.944" fovy="58"/>
+  </worldbody>
+</mujoco>
