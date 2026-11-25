@@ -24,7 +24,8 @@ Intel RealSense D435i.
 | Real camera: 60 fps stream | ✅ |
 | Calibration: marker map in the arm frame, camera pose from the markers alone | 🔧 new, tested in simulation only |
 | Real tracking in shadow mode (arm unpowered) | 🔧 ready, being tested |
-| Gravity-compensated hold for joints 2-3, powered interception | ⏳ next |
+| Powered sweep of the catching area (all joints, stops on contact) | 🔧 new, tested on simulated motors only |
+| Powered interception | ⏳ next |
 
 ## Repository layout
 
@@ -88,6 +89,7 @@ scripts/real/start_camera.sh
 # 4. calibration, once: map of the table markers in the arm frame (docs/calibration_protocol.md)
 .venv/bin/python scripts/real/calibrate.py              # guided: views, touches, sweep -> config/rig_map.json
 .venv/bin/python scripts/real/check_calibration.py      # live check; the camera may be moved afterwards
+.venv/bin/python scripts/real/catch_sweep.py --dry-run  # powered: jaw along the intercept line (read the docs first)
 
 # 5. live tracking with the arm in shadow mode
 .venv/bin/python scripts/real/real_tracking.py
@@ -98,9 +100,10 @@ Calibration results, logs and camera frames are written to `outputs/`, which is 
 ### Safety
 
 Every hardware script enables only the motors it moves; the CAN wrapper refuses commands to any other
-motor. Powered scripts stop and disable on tracking error, stall, faults, lost feedback, unexpected
+motor. Powered scripts stop on tracking error, stall, faults, lost feedback, unexpected
 motion of other joints, Ctrl+C and exceptions. Joints 2 and 3 carry the arm's weight and drop when
-disabled, so they are not moved until a gravity-compensated hold exists. Read
+disabled, so the one script that powers them (`catch_sweep.py`) holds position when it stops and
+releases the arm only into your hand. Read
 [docs/real_rig.md#safety-rules](docs/real_rig.md#safety-rules) before powering anything.
 
 ## How it works

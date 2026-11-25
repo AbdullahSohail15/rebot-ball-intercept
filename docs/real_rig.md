@@ -128,6 +128,19 @@ the arm's own readings, and the planner commands the arm through the same model,
 The step-by-step lab protocol, acceptance thresholds, what to do when a check fails and the
 validation experiment are in [calibration_protocol.md](calibration_protocol.md).
 
+**Powered sweep of the catching area** (after the calibration):
+
+```bash
+.venv/bin/python scripts/real/catch_sweep.py --dry-run     # plan and checks only
+.venv/bin/python scripts/real/catch_sweep.py --passes 60   # first: one pass 60 mm above the table
+.venv/bin/python scripts/real/catch_sweep.py               # 60, 35 and 20 mm
+```
+
+The arm moves its jaw along the intercept line, left to right and back, stepping down to the
+blocking height. This powers all six arm joints. You hand the arm over to the motors at the start
+pose and take it back at the end; in between it stops and holds if it touches the table or anything
+else. Read [calibration_protocol.md](calibration_protocol.md#powered-sweep-of-the-catching-area) first.
+
 ## 5. Live tracking (shadow mode)
 
 ```bash
@@ -156,13 +169,15 @@ The planner (`eaiproject/real_intercept.py`) is the sim policy in real time:
 - IK in the MuJoCo model,
 - heights from the table plane in `config/rig_map.json`.
 
-**Next (not done yet):** a gravity-compensated hold for joints 2-3, a slow powered move to the
-intercept pose, then closed-loop blocking with slow rolls.
+**Next (not done yet):** closed-loop blocking with slow rolls. `catch_sweep.py` already holds the arm
+with the motors' position mode and moves it along the intercept line.
 
 ## Safety rules
 
 - Run the read-only checks after any change to wiring, firmware or zero positions.
 - Joints 2 and 3 drop when disabled. Support the arm whenever it is unpowered and away from rest.
+- `catch_sweep.py` is the only script that powers joints 2 and 3. Hand the arm to it and take it back
+  by hand, as it asks.
 - Every powered script enables only the joints it moves. It aborts and disables on tracking error,
   stall/torque, faults, lost feedback, unexpected motion of other joints, Ctrl+C and exceptions.
 - Motor parameter writes are RAM-only (type 18). Nothing is saved to the motors' flash.

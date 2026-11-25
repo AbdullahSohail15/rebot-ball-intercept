@@ -145,6 +145,43 @@ second. After moving the camera, press `c` in the window.
 | fingertip on a corner | < 5 mm | if the markers are fine but the fingertip is off everywhere by the same amount, the arm or the markers moved since the calibration: calibrate again |
 | ball on a known point | < 5 mm | markers fine but the ball is off: retune the colour (`a`); a ball seen half in shadow shifts by a few mm |
 
+## Powered sweep of the catching area
+
+`catch_sweep.py` moves the jaw along the intercept line, left to right and back, at the blocking
+pose: first 60 mm above the calibrated table, then 35 mm, then at the blocking height of 20 mm. It
+shows that the arm reaches the whole catching area and that the calibrated table height is right
+where it will work. **It powers all six arm joints**, including joints 2 and 3 that carry the
+arm's weight. It has run only against simulated motors so far; follow the order below.
+
+```bash
+.venv/bin/python scripts/real/catch_sweep.py --dry-run       # 1. plan and checks, nothing powered
+.venv/bin/python scripts/real/catch_sweep.py --passes 60     # 2. one pass high above the table
+.venv/bin/python scripts/real/catch_sweep.py                 # 3. 60, 35 and 20 mm
+```
+
+1. Hold the unpowered arm by hand over the middle of the line, fingers forward and tilted down,
+   fingertips about 6 cm above the table. The terminal shows how far it is from the start pose.
+2. ENTER: the motors engage at the pose they are in. **Keep your hands on the arm until it prints
+   `HOLDING`**, then let go and step back.
+3. It moves by itself. `Ctrl+C` stops it; it then holds its position.
+4. At the end, or after any stop, it holds and waits. **Support the arm with your hand**, then
+   ENTER releases the motors.
+
+It stops and holds, without going limp, when a joint's current leaves what is expected (touching
+the table or anything else), when a joint lags its target or sits at its current limit (blocked),
+when readings are lost, or when the jaw is pushed. Only a second `Ctrl+C` or an unexpected error
+disables the motors at once; the fingertips are then at most 6 cm above the table.
+
+| it prints | meaning | do |
+|---|---|---|
+| `NOT RUNNING: ... lowest arm point` | in the model the path would come too close to the calibrated table | check the table plane in the calibration report |
+| `cannot hold the arm safely here` | the arm sags or a current is near its limit right after engaging | keep holding the arm, ENTER to release. Read the printed currents before raising `--cap` |
+| `CONTACT during 'pass at 20 mm' ... fingertip at y = ...` | the arm touched something there. If nothing is in the way, the table is higher there than the map says | look at where the fingertips are. Sweep that area again in `calibrate.py` (step 3) and solve |
+| `CONTACT` although nothing is touched | the threshold is too tight for this arm | each pass prints how close the currents came; rerun with `--contact 1.5` |
+| `... behind its target: blocked` | something stops a joint | clear the workspace |
+
+The run is logged to `outputs/hardware/catch_sweep_<time>.csv` (targets, positions, currents).
+
 ## Validation experiment (course evidence)
 
 3 camera positions × 5 ball positions with known coordinates, error in mm in the arm frame.

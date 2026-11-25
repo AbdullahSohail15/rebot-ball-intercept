@@ -142,3 +142,115 @@ class FakeArm:
 
     def close(self):
         pass
+
+
+class SimClock:
+    """Simulated time for the powered-motion tests: sleeping advances the motors, not the wall clock."""
+
+    def __init__(self):
+        self.t, self.listeners = 0.0, []
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, dt: float) -> None:
+        dt = max(float(dt), 1e-4)
+        self.t += dt
+        for f in self.listeners:
+            f(dt)
+
+
+class FakeMotors:
+    """Stands in for RobStrideBus: six arm motors in position mode plus the gripper motor.
+
+    Enabled motors follow loc_ref at the firmware speed limit and draw current for the gravity load
+    (from the model), friction and noise. Where the arm's lowest point is under the TRUE table the
+    table pushes back: more current on joints 2 and 3, and the arm cannot go lower. `block_j1` is an
+    obstacle joint 1 cannot turn past. Like the real wrapper it refuses commands to motors that are
+    not in `movable`.
+    """
+    P_RUN_MODE, P_LOC_REF, P_LIMIT_SPD, P_LIMIT_CUR, P_MECHPOS, P_IQF = 0x7005, 0x7016, 0x7017, 0x7018, 0x7019, 0x701A
+
+    def __init__(self, model, true_plane, q0, clock: SimClock, movable=(), amps_per_nm=1.3, block_j1=None):
+        self.model, self.true_plane, self.clock = model, np.asarray(true_plane, float), clock
+        self.movable, self.k, self.block_j1 = tuple(movable), amps_per_nm, block_j1
+        self.pos = np.r_[np.asarray(q0, float), 0.0]                 # 6 arm joints + gripper
+        self.vel = np.zeros(7)
+        self.par = {m: {self.P_RUN_MODE: 0, self.P_LOC_REF: 0.0, self.P_LIMIT_SPD: 2.0, self.P_LIMIT_CUR: 23.0} for m in range(1, 8)}
+        self.on: set[int] = set()
+        self.ever_on: set[int] = set()
+        self.writes = 0
+        self.min_clearance = np.inf                                   # lowest the arm ever got above the TRUE table
+        self.closed = False
+        self.rng = np.random.default_rng(0)
+        self._clear, self._grav = self.clearance(), self.model.gravity([self.pos[:6]])[0]
+        clock.listeners.append(self.step)
+
+    def clearance(self) -> float:
+        saved = self.model.plane
+        self.model.plane = self.true_plane
+        try:
+            return self.model.clearance(self.pos[:6])
+        finally:
+            self.model.plane = saved
+
+    def step(self, dt: float) -> None:
+        before = self.pos.copy()
+        for m in self.on:
+            i = m - 1
+            d = self.par[m][self.P_LOC_REF] - self.pos[i]
+            self.pos[i] += float(np.clip(d, -self.par[m][self.P_LIMIT_SPD] * dt, self.par[m][self.P_LIMIT_SPD] * dt))
+        if self.block_j1 is not None:
+            self.pos[0] = min(self.pos[0], self.block_j1)
+        if (self.pos[:6] != before[:6]).any() and self.clearance() < -0.006:      # the table does not give way
+            self.pos[:6] = before[:6]
+        self.vel = (self.pos - before) / dt
+        self._clear, self._grav = self.clearance(), self.model.gravity([self.pos[:6]])[0]
+        self.min_clearance = min(self.min_clearance, self._clear)
+
+    def current(self, m: int) -> float:
+        if m not in self.on or m == 7:
+            return 0.0
+        i = m - 1
+        iq = self.k * self._grav[i] + 0.25 * np.sign(self.vel[i]) + self.rng.normal(0, 0.04)
+        pen = max(0.0, -self._clear)
+        if pen > 0 and m in (2, 3):
+            iq += (900.0 if m == 2 else -600.0) * pen                 # the table carries part of the arm
+        if self.block_j1 is not None and m == 1 and self.par[1][self.P_LOC_REF] > self.block_j1 + 1e-3:
+            iq += 40.0 * (self.par[1][self.P_LOC_REF] - self.block_j1)
+        return float(np.clip(iq, -self.par[m][self.P_LIMIT_CUR], self.par[m][self.P_LIMIT_CUR]))
+
+    def _allowed(self, m: int) -> None:
+        if m not in self.movable:
+            raise RuntimeError(f"refusing to command motor {m}: not in movable={self.movable}")
+
+    def read_param_f32(self, m, idx, timeout=0.05):
+        if idx == self.P_MECHPOS:
+            return float(self.pos[m - 1])
+        if idx == self.P_IQF:
+            return self.current(m)
+        return float(self.par[m][idx])
+
+    def read_param_u8(self, m, idx, timeout=0.05):
+        return int(self.par[m][idx])
+
+    def write_param_f32(self, m, idx, value):
+        self._allowed(m)
+        self.writes += 1
+        self.par[m][idx] = float(value)
+
+    def write_param_u8(self, m, idx, value):
+        self._allowed(m)
+        self.writes += 1
+        self.par[m][idx] = int(value)
+
+    def enable(self, m):
+        self._allowed(m)
+        self.on.add(m)
+        self.ever_on.add(m)
+
+    def stop(self, m):
+        self.on.discard(m)
+
+    def close(self):
+        self.closed = True
