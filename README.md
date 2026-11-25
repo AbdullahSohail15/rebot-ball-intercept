@@ -42,7 +42,7 @@ eaiproject/                     Python package
 config/rig_map.json             the marker map (written by scripts/real/calibrate.py)
 tests/                          synthetic calibration tests and a simulated rig (no hardware)
 scripts/
-  sim/                          render_demo, eval_scripted, eval_tracked, live_tracking
+  sim/                          render_demo, eval_scripted, eval_tracked, live_tracking, calibration_demo
   real/                         hardware: checks, motion tests, camera server, calibration, tracking
 assets/rebot_b601_rs/           arm model (MJCF/URDF/meshes) from Seeed + our scene XML
 docs/

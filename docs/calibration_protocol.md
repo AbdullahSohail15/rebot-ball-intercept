@@ -9,6 +9,9 @@ finds the camera pose from the markers by itself when it starts.
 - **Use** (every session, nothing to do): `real_tracking.py` and `check_calibration.py` locate the
   camera from the markers at start, and again when you press `c` after moving it.
 
+A 2-minute video of the whole flow on a simulated rig (the real scripts, simulated camera and arm):
+[media/calibration_demo.mp4](media/calibration_demo.mp4). `scripts/sim/calibration_demo.py` makes it.
+
 Redo the calibration only if a marker, the arm or the table has moved. Everything is read-only on
 CAN: no script here enables or moves a motor.
 

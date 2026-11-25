@@ -863,8 +863,7 @@ class PoseMonitor:
     @property
     def warning(self) -> str | None:
         if self.bad >= 2:
-            return (f"CAMERA MOVED? markers are {self.median_px:.1f} px off the map (limit {self.warn_px} px): "
-                    "press c to locate the camera again")
+            return f"CAMERA MOVED? markers are {self.median_px:.1f} px off the map: press c"
         return None
 
 

@@ -36,14 +36,10 @@ from eaiproject.real_intercept import (HostClock, InterceptPlanner, auto_hsv, ca
                                        locate_camera, make_tracker, save_hsv, table_z)
 from eaiproject import rig_calib  # noqa: E402
 from eaiproject.realsense_client import RealSenseClient  # noqa: E402
+from eaiproject.rig_draw import put  # noqa: E402
 
 WIN, HSV_WIN = "real tracking (shadow arm)", "HSV"
 PRED_AT = (0.5, 0.3, 0.15)          # seconds before crossing at which the prediction is scored
-
-
-def put(img, text, org, color=(255, 255, 255), scale=0.5, thick=1):
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
 
 
 class Roll:

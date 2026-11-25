@@ -56,6 +56,7 @@ class World:
             mask = cv2.warpPerspective(np.full_like(m, 255), H, (TEX_W, TEX_H))
             self.texture[mask > 0] = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)[mask > 0]
         self.ball = None                           # (x, y) of the ball on the table, or None
+        self.tip = None                            # physical fingertip position to draw the arm's fingers at, or None
 
     def tex(self, xy) -> np.ndarray:
         xy = np.asarray(xy, float).reshape(-1, 2)
@@ -93,15 +94,21 @@ class FakeCamera:
             depth = (cv2.Rodrigues(self.rvec)[0] @ c + self.tvec)[2]
             cv2.circle(img, (int(round(uv[0] * 16)), int(round(uv[1] * 16))), int(round(Ks[0, 0] * rc.BALL_R / depth * 16)),
                        (20, 130, 255), -1, cv2.LINE_AA, shift=4)
+        if w.tip is not None:                       # the gripper as a grey wedge ending at the fingertips
+            tip = np.asarray(w.tip, float)
+            back = tip + [-0.13, 0.0, 0.075] if tip[0] > 0.13 else tip + [0.0, 0.0, 0.15]
+            side = np.array([0.0, 0.035, 0.0])
+            poly = rc.project(Ks, self.dist, self.rvec, self.tvec, [tip + side * 0.15, back + side, back - side, tip - side * 0.15])
+            cv2.fillConvexPoly(img, np.round(poly * 16).astype(np.int32), (70, 72, 78), cv2.LINE_AA, shift=4)
         return cv2.resize(img, (self.width, self.height), interpolation=cv2.INTER_AREA)
 
     def read(self, timeout=1.0, newer_than=None) -> Frame:
-        key = (self.rvec.tobytes(), self.tvec.tobytes(), self.world.ball)
+        key = (self.rvec.tobytes(), self.tvec.tobytes(), self.world.ball, None if self.world.tip is None else tuple(self.world.tip))
         if getattr(self, "_key", None) != key:
             self._key, self._clean = key, self._render()
         img = np.clip(self._clean.astype(np.int16) + self.rng.integers(-3, 4, self._clean.shape, dtype=np.int16), 0, 255)
         self.n += 1
-        return Frame(img.astype(np.uint8), self.n, self.n * 33.3, time.monotonic())
+        return Frame(img.astype(np.uint8), self.n, time.monotonic() * 1000.0, time.monotonic())
 
     def close(self):
         pass

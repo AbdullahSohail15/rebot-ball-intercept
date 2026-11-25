@@ -125,6 +125,8 @@ find the camera pose from the markers when they start, and again when you press 
 The arm's model reads heights 8-15 mm off. Because the map and the table plane are measured with
 the arm's own readings, and the planner commands the arm through the same model, this error cancels.
 
+What the windows look like, on a simulated rig: [media/calibration_demo.mp4](media/calibration_demo.mp4).
+
 The step-by-step lab protocol, acceptance thresholds, what to do when a check fails and the
 validation experiment are in [calibration_protocol.md](calibration_protocol.md).
 
