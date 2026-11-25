@@ -35,7 +35,10 @@ eaiproject/                     Python package
   real_intercept.py             real rig: calibration loading, tracker setup, real-time planner
   robstride.py                  RobStride CAN protocol over PEAK PCAN-USB (with a motor allow-list)
   realsense_client.py           client for the RealSense frame server
+  rig_calib.py                  marker map in the arm frame: joint solver, relocalisation, checks
   kinematics.py, markers.py, calib_board.py   FK from joint readings, ArUco markers, ChArUco board
+config/rig_map.json             the marker map (written by scripts/real/rig_solve.py)
+tests/                          synthetic calibration tests and a simulated rig (no hardware)
 scripts/
   sim/                          render_demo, eval_scripted, eval_tracked, live_tracking
   real/                         hardware: checks, motion tests, camera server, calibration, tracking
@@ -44,6 +47,7 @@ assets/rebot_b601_rs/           arm model (MJCF/URDF/meshes) from Seeed + our sc
 docs/
   simulation.md                 sim details, env API, results
   real_rig.md                   hardware setup, step-by-step bring-up, safety, troubleshooting
+  calibration_protocol.md       lab protocol for the camera-to-arm calibration
   charuco_board_A4.pdf          optional printable calibration board
 ```
 
@@ -82,9 +86,12 @@ including the macOS-specific camera and CAN setup, is in [docs/real_rig.md](docs
 scripts/real/start_camera.sh
 .venv/bin/python scripts/real/camera_view.py
 
-# 4. calibration: camera pose from ArUco markers + fingertip touches, then the table height
-.venv/bin/python scripts/real/calibrate_markers.py
-.venv/bin/python scripts/real/table_height.py
+# 4. calibration, once: map of the table markers in the arm frame (docs/calibration_protocol.md)
+.venv/bin/python scripts/real/rig_capture.py views      # then: touch, sweep
+.venv/bin/python scripts/real/rig_solve.py              # -> config/rig_map.json
+#    every session, and after the camera moved: camera pose from the markers alone
+.venv/bin/python scripts/real/relocalize.py
+.venv/bin/python scripts/real/check_calibration.py
 
 # 5. live tracking with the arm in shadow mode
 .venv/bin/python scripts/real/real_tracking.py
@@ -110,9 +117,10 @@ disabled, so they are not moved until a gravity-compensated hold exists. Read
 3. **Planning.** The open jaw (fingertips 20 mm above the table, tilted 30° down, turned to face the
    ball) is moved along the line with rate limits. Damped least-squares IK in the MuJoCo model gives
    the joint targets.
-4. **Calibration (real rig).** The camera pose comes from ArUco markers whose robot-frame positions are
-   measured by touching them with the arm's fingertips. Heights are relative to a table plane measured
-   the same way, which cancels the arm model's height bias.
+4. **Calibration (real rig).** The arm's fingertips touch the corners of the table's ArUco markers
+   once, which gives a map of the markers in the arm's own kinematic frame. The camera pose is then
+   recovered from the markers alone, so the camera can be moved. Heights are relative to a table
+   plane measured by sliding the fingertips over it, which cancels the arm model's height bias.
 
 ## Contributing
 

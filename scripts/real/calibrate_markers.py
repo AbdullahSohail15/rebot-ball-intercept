@@ -1,5 +1,8 @@
 """Camera-to-robot calibration with the ArUco markers on the rig + one fingertip touch per marker.
 
+OLDER SINGLE-VIEW METHOD: valid for one camera position only. The current flow is rig_capture.py +
+rig_solve.py once, then relocalize.py every session (docs/calibration_protocol.md).
+
 1. CAMERA  Arm and hands clear of the markers. SPACE averages every marker's corners over 30 frames.
 2. TOUCH   For each marker in turn (yellow circle in the window), guide the unpowered arm and rest the
            CLOSED fingertips on the CENTRE of the marker, SPACE. Hands may be anywhere in view now.

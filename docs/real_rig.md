@@ -22,7 +22,7 @@ time. Do them in order the first time.
 | Arm | Seeed Studio reBot Arm B601-RS: RobStride RS06 motors on joints 1-3, RS00 on joints 4-6 and the gripper (CAN IDs 1-7, host ID 0xFD), 48 V supply |
 | CAN adapter | PEAK PCAN-USB (shows up as "XCAN-USB", USB 0c72:000c), 1 Mbit/s |
 | Camera | Intel RealSense D435i, USB 3, fixed on a stand looking at the table |
-| Markers | ArUco markers taped flat on the table (70 mm, `DICT_ARUCO_ORIGINAL`, IDs 107, 880, 467, 718) and on the arm's mounting plate (50 mm, `DICT_4X4_50`, IDs 0 and 2). Defined in `eaiproject/markers.py`. |
+| Markers | ArUco markers taped flat on the table (70 mm, `DICT_ARUCO_ORIGINAL`, IDs 107, 880, 467, 718) and on the arm's mounting plate (50 mm, `DICT_4X4_50`, IDs 0 and 2). Defined in `eaiproject/markers.py`. The current calibration uses only the table markers. |
 | Ball | orange ping-pong ball, 44 mm |
 
 Tested on an Apple Silicon Mac. Linux should be simpler (no root needed for the camera, SocketCAN for
@@ -98,7 +98,7 @@ scripts/real/start_camera.sh                  # 640x480 @ 60 fps; password dialo
 
 Aim the camera so it sees the arm, the area in front of it (the intercept line is 0.40 m from the
 base) and the table out to where the ball is launched, with all markers detected. Then fix the camera
-firmly: the calibration is only valid for that pose and that resolution.
+firmly. If it moves, run `relocalize.py` again (the pose file is valid for one pose and one resolution).
 
 Stop the server with
 `.venv/bin/python -c "from eaiproject.realsense_client import RealSenseClient as C; C().stop_server()"`.
@@ -106,7 +106,27 @@ It also stops after 30 minutes without clients.
 
 ## 4. Calibration
 
-**Camera pose, with the markers** (no measuring tape):
+**Current method: a marker map, then relocalisation.** The arm touches the table markers once
+(`rig_capture.py`, `rig_solve.py`); the result is `config/rig_map.json`. After that the camera can be
+moved: `relocalize.py` recovers its pose from the markers at the start of every session, and
+`check_calibration.py` shows whether it is right. The step-by-step lab protocol, thresholds and the
+validation experiment are in [calibration_protocol.md](calibration_protocol.md).
+
+```bash
+scripts/real/start_camera.sh --width 1280 --height 720 --fps 30      # static calibration, once
+.venv/bin/python scripts/real/rig_capture.py views                    # >= 5 camera positions
+.venv/bin/python scripts/real/rig_capture.py touch                    # fingertips on marker corners
+.venv/bin/python scripts/real/rig_capture.py sweep                    # fingertips slid over the table
+.venv/bin/python scripts/real/rig_solve.py                            # -> config/rig_map.json, table_height.json
+
+scripts/real/start_camera.sh                                          # every session, tracking stream
+.venv/bin/python scripts/real/relocalize.py                           # -> camera_extrinsics.json
+.venv/bin/python scripts/real/check_calibration.py
+```
+
+**Older single-view method** (still works; everything must be redone when the camera moves).
+
+Camera pose, with the markers (no measuring tape):
 
 ```bash
 .venv/bin/python scripts/real/calibrate_markers.py
@@ -122,7 +142,7 @@ It also stops after 30 minutes without clients.
 Result on our rig: 0.4-0.5 px fit error on the table markers. The camera sees the full ±25 cm lane
 from x = -0.08 to 0.98 m.
 
-**Table height where the arm works:**
+Table height where the arm works (older method; `rig_solve.py` now writes the same file from the sweep):
 
 ```bash
 .venv/bin/python scripts/real/table_height.py

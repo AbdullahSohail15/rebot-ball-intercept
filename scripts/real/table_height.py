@@ -1,5 +1,8 @@
 """Measure the table height where the arm works, in the arm's OWN kinematic frame.
 
+OLDER METHOD (5 touches): rig_capture.py sweep + rig_solve.py now write the same table_height.json
+from a sweep of the surface (docs/calibration_protocol.md).
+
 The fingertip heights the arm reports are biased (joint zeros / fingertip model): on the plate it
 reads +9 mm, on the table +6 mm. Rather than chase the cause, measure the table where the blocking
 happens and command heights relative to that: any constant or slowly varying model error cancels.
