@@ -1,18 +1,18 @@
-# Calibration protocol (camera to arm, v2)
+# Calibration protocol (camera to arm)
 
-The arm touches the table markers **once**. After that the camera can be moved freely: its pose is
-recovered from the markers alone at the start of every session.
+The arm touches the table markers **once**. After that the camera can stand anywhere: every tool
+finds the camera pose from the markers by itself when it starts.
 
-- **Static calibration** (once, about 20 min of arm time): where the table markers and the table
-  surface are in the arm's kinematic frame. Result: `config/rig_map.json` (committed) and
-  `outputs/calibration/table_height.json`.
-- **Relocalisation** (every session, 10 s, no arm): camera pose from the markers. Result:
-  `outputs/calibration/camera_extrinsics.json`, which `real_tracking.py` and the planner read as before.
+- **Calibrate** (once, about 20 min, of which 15 with the arm): `scripts/real/calibrate.py`, one
+  guided window. Result: `config/rig_map.json`, the marker corners and the table plane in the arm's
+  frame. Commit it.
+- **Use** (every session, nothing to do): `real_tracking.py` and `check_calibration.py` locate the
+  camera from the markers at start, and again when you press `c` after moving it.
 
-Redo the static part only if a marker, the arm or the table has moved. Everything is read-only on
+Redo the calibration only if a marker, the arm or the table has moved. Everything is read-only on
 CAN: no script here enables or moves a motor.
 
-"Kinematic frame" means positions as the arm's own model reports them (`Fingertip`, MuJoCo FK from
+"The arm's frame" means positions as the arm's own model reports them (`Fingertip`, MuJoCo FK from
 the joint readings). That model reads heights 8-15 mm off. Calibrating with the arm's own readings
 absorbs this, because the planner commands the arm through the same model.
 
@@ -20,30 +20,36 @@ absorbs this, because the planner commands the arm through the same model.
 
 | check | why |
 |---|---|
-| 4 or more table markers (70 mm, `DICT_ARUCO_ORIGINAL`) taped flat, at least 2 within the arm's reach, at least 1 further than 0.50 m from the base | reach: needed for the touches. Far marker: relocalisation refuses without one |
+| 4 or more table markers (70 mm, `DICT_ARUCO_ORIGINAL`) taped flat, at least 2 within the arm's reach, at least 1 further than 0.50 m from the base | reach: needed for the touches. Far marker: the camera cannot be located without one in view |
 | Measure one printed marker's black square with a ruler: 70.0 ± 0.3 mm | the camera measures every distance in units of the marker size |
 | Each marker has a white margin of at least 1 cm, no tape over the black border, no curled edges | corners are found from the border's edges |
 | Markers that are not in a line, as far apart as the arm can reach (20 cm or more) | the direction (yaw) of the whole map comes only from the touched points |
 | Laptop with the repo, `.venv`, PCAN adapter, RealSense on USB 3, camera stand, orange ball | |
-| `git checkout calibration-v2` and `.venv/bin/python -m unittest discover -s tests` passes | 23 tests, 15 s, no hardware |
+| `git checkout calibration-v2` and `.venv/bin/python -m unittest discover -s tests` passes | 22 tests, 15 s, no hardware |
 
-New marker: add one line to `SIZES` in `eaiproject/markers.py` (`"orig:<id>": 0.070`). Every key
-that starts with `orig:` is a table marker. The plate markers (`4x4:`) are ignored.
+New marker: add one line to `SIZES` in `eaiproject/markers.py` (`"<id>": 0.070`), then calibrate again.
 
-## Static calibration
+## Calibrate
 
-| step | command | arm | time |
-|---|---|---|---|
-| 0. Start | `scripts/real/start_camera.sh --width 1280 --height 720 --fps 30` and `.venv/bin/python scripts/real/gripper_test.py` (joint states print) | on, not enabled | 3 min |
-| 1. Views | `.venv/bin/python scripts/real/rig_capture.py views` | not needed | 5 min |
-| 2. Corner touches | `.venv/bin/python scripts/real/rig_capture.py touch` | by hand | 8 min |
-| 3. Surface sweep | `.venv/bin/python scripts/real/rig_capture.py sweep` | by hand | 5 min |
-| 4. Solve | `.venv/bin/python scripts/real/rig_solve.py` | not needed | 1 min |
+```bash
+scripts/real/start_camera.sh --width 1280 --height 720 --fps 30
+.venv/bin/python scripts/real/gripper_test.py        # joint states print: the arm answers on CAN
+.venv/bin/python scripts/real/calibrate.py
+```
 
-Steps 1-3 save to `outputs/rig_calib/<date>/` after every record. Each can be stopped, resumed or
-repeated on its own, and step 4 can be rerun at home. If arm time is short, do steps 2 and 3 first.
+| step in the window | arm | time |
+|---|---|---|
+| 1 Views: the camera at 5 or more positions | not needed | 5 min |
+| 2 Touch: fingertips on marker corners | by hand, unpowered | 8 min |
+| 3 Sweep: fingertips slid over the table | by hand, unpowered | 5 min |
+| Solve: result on screen, map and report written | not needed | 10 s |
 
-### 1. Views (camera only)
+ENTER goes to the next step, BACKSPACE to the previous one, `1` `2` `3` jump to a step, `q` quits.
+Everything is saved after every record, so you can quit at any time and run the script again: it
+continues where you stopped. If arm time is short, press `2` and do steps 2 and 3 first; step 1
+needs no arm. `calibrate.py --solve` repeats the solve from the saved data without any hardware.
+
+### Step 1: views (camera only)
 
 Arm and hands away from the markers. Put the camera somewhere, wait until it is still, press
 SPACE (30 frames are averaged). Move it and repeat.
@@ -54,20 +60,20 @@ SPACE (30 frames are averaged). Move it and repeat.
 - A view is refused if the corners moved more than 0.5 px while averaging: the stand was still
   swinging. `u` removes the last view.
 
-### 2. Corner touches (arm unpowered, moved by hand)
+### Step 2: corner touches (arm unpowered, moved by hand)
 
 The camera can stay anywhere that sees the markers. Support the arm: joints 2 and 3 drop when
 they are not powered.
 
 - The window circles **one corner in yellow** with its name (TL, TR, BR, BL; TL has the filled
   dot). Rest the **closed** fingertips on exactly that corner, hold still, SPACE.
-- After the 4 corners press `n` for the next marker (`p` goes back). Skip the markers you cannot
+- After the 4 corners press `n` for the next marker (`p` goes back). Pass the markers you cannot
   reach with `n`. `c` records the marker centre (optional), `s` skips one corner, `u` undoes.
 - **How many:** all 4 corners of every marker within reach, **at least 2 markers**, 3 if possible.
 - A red `CHECK:` line means the new point does not fit the others (wrong corner, or the fingertip
   was not on the table). Press `u` and repeat that corner.
 
-### 3. Surface sweep (arm unpowered, moved by hand)
+### Step 3: surface sweep (arm unpowered, moved by hand)
 
 Hold the gripper at the blocking tilt: fingers forward and about 30° down. The window shows the
 tilt in green while it is within ±5°.
@@ -81,53 +87,51 @@ tilt in green while it is within ±5°.
   in total. Two or three slow passes are enough.
 - `u` removes the last stroke. Samples at the wrong tilt are kept in the file and left out by the solve.
 
-### 4. Solve
+### Solve
 
-`rig_solve.py` prints the report and writes `config/rig_map.json`, `table_height.json` and the
-report folder `outputs/rig_calib/<date>/report/`.
+After step 3, ENTER solves and shows the result: the map from above, the three headline numbers and
+any warnings. It also writes `config/rig_map.json` and the report folder
+`outputs/rig_calib/<date>/report/`. To fix something, go back with BACKSPACE or `1` `2` `3`, redo
+that part, and ENTER through to the solve again.
 
 | quantity in the report | accept | if not |
 |---|---|---|
-| reprojection RMS | < 1.5 px (expect 0.2-0.5) | look at `report/reproj_view_XX.png`. One bad view: recapture the views without it. All bad: wrong camera resolution or a marker lifted off the table |
-| corner touches RMS | < 5 mm (expect 2-3) | the report lists every touch; redo the ones marked `<-- check` (run `touch` again, select the marker, `u` / SPACE) and solve again |
-| leave-one-marker-out | within about 2.5× the "touch noise explains" value | one marker's touches are inconsistent with the others: retouch that marker |
+| reprojection RMS | < 1.5 px (expect 0.1-0.5) | look at `report/reproj_view_XX.png`. One bad view: step 1, record the views again. All bad: a marker lifted off the table, or the camera stream changed |
+| corner touches RMS | < 5 mm (expect 2-3) | `report.txt` lists every touch; redo the ones marked `<-- check` in step 2 (select the marker with `n`, `u`, SPACE) |
+| leave-one-marker-out | within about 2.5× the "touch noise explains" value | one marker's touches do not fit the others: touch that marker again |
 | touched points span / width | span ≥ 20 cm, width ≥ 5 cm | touch another marker further away, or all 4 corners |
-| scale check | within the ± printed next to it | the printed marker is not 70 mm, or the camera stream is not the one the intrinsics belong to |
-| sweep RMS | < 1.5 mm | look at `report/sweep_heatmap.png`: random speckle = lifted fingertips, sweep again. A smooth trend = model error; the report says whether a quadratic surface was saved |
+| scale check | within the ± printed next to it | the printed marker is not 70 mm |
+| sweep RMS | < 1.5 mm | look at `report/sweep_heatmap.png`: random speckle = lifted fingertips, sweep again. A smooth trend = model error; a warning says so |
 | warnings | none | each warning says what to do |
 
-`git add config/rig_map.json && git commit` when the report is clean.
+`git add config/rig_map.json && git commit` when the result is clean.
 
 ## Every session
 
 ```bash
-scripts/real/start_camera.sh                                # 640x480 @ 60, the tracking stream
-.venv/bin/python scripts/real/relocalize.py                 # 10 s, no arm
+scripts/real/start_camera.sh                                # 640x480 @ 60
 .venv/bin/python scripts/real/check_calibration.py          # optional, 2 min
 .venv/bin/python scripts/real/real_tracking.py
 ```
 
-`relocalize.py` must run on the stream that tracking uses: the result is valid for that resolution
-only, and `real_tracking.py` refuses a mismatch.
+Both tools locate the camera when they start: keep hands and arm off the markers for the first
+second. After moving the camera, press `c` in the window.
 
-| relocalize.py says | meaning | do |
+| message | meaning | do |
 |---|---|---|
-| `status OK` | < 1.5 px and < 5 mm on the table | go on |
-| `status WARN` | 1.5-3 px | usable; check lighting and that the camera is fixed, run it again |
-| `REFUSED: only N map marker(s) visible` | fewer than 3 markers were read | move the camera closer or higher. At 640x480 a 70 mm marker is read reliably up to about 1.2 m |
-| `REFUSED: no marker far from the arm` | only the markers next to the arm are seen | aim further down the table |
-| `NOT WRITTEN` (FAIL, > 3 px) | the image does not fit the map | see `outputs/calibration/relocalize_overlay.png`; a marker has moved (redo the static part) or the stream is wrong |
-| `... disagree with the map and were left out` | one marker moved on the table | fine for today; redo the static calibration before relying on it |
-
-While `real_tracking.py` runs it compares the markers with the map every 3 s. A red
-**CAMERA MOVED?** line means the camera was bumped: stop, run `relocalize.py`, start again.
+| `camera located: OK` | < 1.5 px and < 5 mm on the table | go on |
+| `camera located: WARN` | 1.5-3 px | usable; check the lighting and that the camera is fixed, press `c` |
+| `CANNOT LOCATE THE CAMERA: only N map marker(s) visible` | fewer than 3 markers were read | move the camera closer or higher. At 640x480 a 70 mm marker is read reliably up to about 1.2 m |
+| `CANNOT LOCATE THE CAMERA: no marker far from the arm` | only the markers next to the arm are seen | aim further down the table |
+| `marker [...] does not fit the map` | one marker moved on the table | fine for today (it is left out); calibrate again before relying on it |
+| red **CAMERA MOVED?** in `real_tracking.py` | the markers no longer sit where the pose says (checked every 3 s) | press `c` |
 
 ## Live check
 
 `check_calibration.py` shows, on the live image:
 
 - **Markers:** the map (magenta) over the detected outlines (green), with px and mm per marker. A
-  `~` after the ID means the marker was found from the predicted position, not read by the detector.
+  `~` after the ID means the marker was found from its predicted position, not read by the detector.
 - **Fingertip:** a magenta ring at the arm's reported fingertip. Move the unpowered arm by hand: the
   ring must stay on the real fingertips. Rest them on a marker corner: the error to that corner
   appears; SPACE records it.
@@ -137,8 +141,8 @@ While `real_tracking.py` runs it compares the markers with the map every 3 s. A 
 
 | check | accept | if not |
 |---|---|---|
-| markers, median | < 1.5 px, < 5 mm | run `relocalize.py` again |
-| fingertip on a corner | < 5 mm | if the markers are fine but the fingertip is off everywhere by the same amount, the arm or the markers moved since the static calibration: redo it |
+| markers, median | < 1.5 px, < 5 mm | press `c` |
+| fingertip on a corner | < 5 mm | if the markers are fine but the fingertip is off everywhere by the same amount, the arm or the markers moved since the calibration: calibrate again |
 | ball on a known point | < 5 mm | markers fine but the ball is off: retune the colour (`a`); a ball seen half in shadow shifts by a few mm |
 
 ## Validation experiment (course evidence)
@@ -150,14 +154,14 @@ While `real_tracking.py` runs it compares the markers with the map every 3 s. A 
    and y = +0.15). They are saved in `outputs/calibration/check_points.json`.
 2. The 5 ball positions are these 2 spots and the centres of 3 markers.
 3. For each camera position (A: front, B: left, C: right and higher):
-   1. move the camera, `relocalize.py`
-   2. `check_calibration.py --label camA`
+   1. move the camera
+   2. `check_calibration.py --label camA` (or press `c` in the open window and restart with the new label)
    3. touch 2 marker corners with the fingertips, SPACE each time (checks the arm frame)
    4. `b`, then put the ball on each of the 5 points in turn, SPACE each time, `s` for a screenshot
 4. All rows go to `outputs/calibration/validation.csv`:
    `camera, kind, point, expected_x/y, measured_x/y, dx_mm, dy_mm, err_mm, reproj_px`.
 
-What each row tests: a ball on a **marker centre** tests the relocalisation and the ball projection
+What each row tests: a ball on a **marker centre** tests locating the camera and the ball projection
 (the marker positions come from the map itself). A ball on a **pen dot** and the **corner touches**
 also test that the map sits correctly in the arm frame. Report them separately.
 
@@ -169,15 +173,8 @@ Pass: mean error < 5 mm for every camera position, and no systematic shift betwe
 |---|---|
 | `config/rig_map.json` (in git) | the map and its fit statistics |
 | `outputs/rig_calib/<date>/report/report.txt`, `layout.png`, `sweep_heatmap.png` | the solve report |
-| `outputs/calibration/relocalize_overlay.png` for each camera position | the pose fit |
-| `outputs/calibration/check_cam*.png` | live-check screenshots |
+| `outputs/calibration/check_cam*.png` | live-check screenshots, one per camera position |
 | `outputs/calibration/validation.csv` | the validation table |
 
 `outputs/` is not in git, and the camera frames in it can show people. Copy only the files above
 into the course report.
-
-## Older single-view method
-
-`calibrate_markers.py` and `table_height.py` still work. They fit the camera pose from one camera
-position plus one touch per marker, so everything has to be redone when the camera moves. Use
-them only as a fallback.

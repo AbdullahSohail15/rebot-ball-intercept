@@ -22,7 +22,7 @@ time. Do them in order the first time.
 | Arm | Seeed Studio reBot Arm B601-RS: RobStride RS06 motors on joints 1-3, RS00 on joints 4-6 and the gripper (CAN IDs 1-7, host ID 0xFD), 48 V supply |
 | CAN adapter | PEAK PCAN-USB (shows up as "XCAN-USB", USB 0c72:000c), 1 Mbit/s |
 | Camera | Intel RealSense D435i, USB 3, fixed on a stand looking at the table |
-| Markers | ArUco markers taped flat on the table (70 mm, `DICT_ARUCO_ORIGINAL`, IDs 107, 880, 467, 718) and on the arm's mounting plate (50 mm, `DICT_4X4_50`, IDs 0 and 2). Defined in `eaiproject/markers.py`. The current calibration uses only the table markers. |
+| Markers | ArUco markers taped flat on the table (70 mm, `DICT_ARUCO_ORIGINAL`, IDs 107, 880, 467, 718). Defined in `eaiproject/markers.py`. The markers on the arm's mounting plate are not used. |
 | Ball | orange ping-pong ball, 44 mm |
 
 Tested on an Apple Silicon Mac. Linux should be simpler (no root needed for the camera, SocketCAN for
@@ -98,7 +98,7 @@ scripts/real/start_camera.sh                  # 640x480 @ 60 fps; password dialo
 
 Aim the camera so it sees the arm, the area in front of it (the intercept line is 0.40 m from the
 base) and the table out to where the ball is launched, with all markers detected. Then fix the camera
-firmly. If it moves, run `relocalize.py` again (the pose file is valid for one pose and one resolution).
+firmly. If it moves later, press `c` in the tracking window: the pose is found again from the markers.
 
 Stop the server with
 `.venv/bin/python -c "from eaiproject.realsense_client import RealSenseClient as C; C().stop_server()"`.
@@ -106,56 +106,27 @@ It also stops after 30 minutes without clients.
 
 ## 4. Calibration
 
-**Current method: a marker map, then relocalisation.** The arm touches the table markers once
-(`rig_capture.py`, `rig_solve.py`); the result is `config/rig_map.json`. After that the camera can be
-moved: `relocalize.py` recovers its pose from the markers at the start of every session, and
-`check_calibration.py` shows whether it is right. The step-by-step lab protocol, thresholds and the
+```bash
+scripts/real/start_camera.sh --width 1280 --height 720 --fps 30
+.venv/bin/python scripts/real/calibrate.py            # once: one guided window, about 20 min
+.venv/bin/python scripts/real/check_calibration.py    # any time: live check
+```
+
+`calibrate.py` builds a map of the table markers in the arm's own frame, in three steps:
+
+1. the camera looks at the markers from 5 or more positions,
+2. the unpowered arm's fingertips touch the corners of the markers within reach,
+3. the fingertips are slid over the table at the blocking tilt.
+
+It then solves for the marker positions and the table plane and writes `config/rig_map.json`
+(commit it). From then on the camera can be moved: `real_tracking.py` and `check_calibration.py`
+find the camera pose from the markers when they start, and again when you press `c`.
+
+The arm's model reads heights 8-15 mm off. Because the map and the table plane are measured with
+the arm's own readings, and the planner commands the arm through the same model, this error cancels.
+
+The step-by-step lab protocol, acceptance thresholds, what to do when a check fails and the
 validation experiment are in [calibration_protocol.md](calibration_protocol.md).
-
-```bash
-scripts/real/start_camera.sh --width 1280 --height 720 --fps 30      # static calibration, once
-.venv/bin/python scripts/real/rig_capture.py views                    # >= 5 camera positions
-.venv/bin/python scripts/real/rig_capture.py touch                    # fingertips on marker corners
-.venv/bin/python scripts/real/rig_capture.py sweep                    # fingertips slid over the table
-.venv/bin/python scripts/real/rig_solve.py                            # -> config/rig_map.json, table_height.json
-
-scripts/real/start_camera.sh                                          # every session, tracking stream
-.venv/bin/python scripts/real/relocalize.py                           # -> camera_extrinsics.json
-.venv/bin/python scripts/real/check_calibration.py
-```
-
-**Older single-view method** (still works; everything must be redone when the camera moves).
-
-Camera pose, with the markers (no measuring tape):
-
-```bash
-.venv/bin/python scripts/real/calibrate_markers.py
-```
-
-1. Hands and arm away from the markers, SPACE: the camera records every marker's corners.
-2. For each marker (yellow circle): rest the closed fingertips of the unpowered arm on the marker's
-   centre, SPACE. At least 3 markers, ideally the two plate markers and the two table markers next to
-   the arm; `s` skips one you can't reach.
-3. The script fits the camera pose, each marker's rotation and small touch errors to all marker corners,
-   and shows a 10 cm table grid over the image to check.
-
-Result on our rig: 0.4-0.5 px fit error on the table markers. The camera sees the full ±25 cm lane
-from x = -0.08 to 0.98 m.
-
-Table height where the arm works (older method; `rig_solve.py` now writes the same file from the sweep):
-
-```bash
-.venv/bin/python scripts/real/table_height.py
-```
-
-Touch the table with the fingertips at the yellow circles along the intercept line, with the gripper
-tilted like the blocking pose. The arm's model reads heights 8-15 mm too high (table at +6 mm, plate
-at +9 mm in its frame, though the base stands on the plate). So the planner commands heights relative
-to this measured plane, and the model error cancels.
-
-Alternatives: `make_calib_board.py` + `calibrate_board.py` use a printed ChArUco board
-([docs/charuco_board_A4.pdf](charuco_board_A4.pdf), print at 100 %) with 4 corner touches.
-`legacy/calibrate_ball.py` uses the ball itself (place it, touch its top).
 
 ## 5. Live tracking (shadow mode)
 
@@ -163,7 +134,8 @@ Alternatives: `make_calib_board.py` + `calibrate_board.py` use a printed ChArUco
 .venv/bin/python scripts/real/real_tracking.py
 ```
 
-The arm is not used at all. The window shows:
+The arm is not used at all. The camera pose is found from the markers at start (`c` finds it again
+after the camera was moved). The window shows:
 
 - the detection, track and velocity,
 - the intercept line and the predicted crossing,
@@ -173,7 +145,7 @@ The arm is not used at all. The window shows:
 Each roll is scored: the predicted crossing 0.5 / 0.3 / 0.15 s before the line against where the ball
 really crossed (gripper margin ±28 mm).
 
-Keys: `a` auto-tunes the ball colour (ball alone on the table), `w` saves it, `h` toggles the mask
+Keys: `c` locates the camera again, `a` auto-tunes the ball colour (ball alone on the table), `w` saves it, `h` toggles the mask
 inset, `r` resets the tracker. The HSV window has sliders.
 
 The planner (`eaiproject/real_intercept.py`) is the sim policy in real time:
@@ -182,7 +154,7 @@ The planner (`eaiproject/real_intercept.py`) is the sim policy in real time:
 - the jaw facing the ball,
 - rate limits on the jaw pose (0.6 m/s sideways, slower than in the sim),
 - IK in the MuJoCo model,
-- heights from the measured table plane.
+- heights from the table plane in `config/rig_map.json`.
 
 **Next (not done yet):** a gravity-compensated hold for joints 2-3, a slow powered move to the
 intercept pose, then closed-loop blocking with slow rolls.
@@ -205,8 +177,9 @@ intercept pose, then closed-loop blocking with slow rolls.
 | camera server: `failed to set power state` | another (stuck) server holds the camera. `start_camera.sh` kills the old one by PID; if it persists, unplug and replug the camera |
 | camera server: `Frame didn't arrive` | the camera re-enumerated. Replug it and restart the server |
 | colour stream gives no frames | depth must be enabled too (the server does this) |
-| small markers not detected | too small / too edge-on in the image. Move the camera closer or higher. The plate markers are 4x4, not ArUco-original. |
-| fingertip reads ~50-60 mm on top of the 44 mm ball | known model height bias. Use `table_height.py` (see above) |
+| small markers not detected | too small / too edge-on in the image. Move the camera closer or higher. |
+| fingertip reads ~50-60 mm on top of the 44 mm ball | known model height bias; the calibration measures the table with the arm itself, so it cancels |
+| `CANNOT LOCATE THE CAMERA` | fewer than 3 markers read, or none far from the arm: see [calibration_protocol.md](calibration_protocol.md#every-session) |
 
 ## Protocol notes
 

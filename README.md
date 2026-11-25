@@ -21,7 +21,8 @@ Intel RealSense D435i.
 | Simulation: vision in the loop (camera model + classic CV tracker) | ✅ 100/100, 2-3 mm error, robust to 30 fps / 100 ms latency |
 | Real arm: CAN link, joint readout, model match | ✅ |
 | Real arm: first powered motions (gripper, single joints) | ✅ |
-| Real camera: 60 fps stream, marker-based calibration to the robot frame | ✅ |
+| Real camera: 60 fps stream | ✅ |
+| Calibration: marker map in the arm frame, camera pose from the markers alone | 🔧 new, tested in simulation only |
 | Real tracking in shadow mode (arm unpowered) | 🔧 ready, being tested |
 | Gravity-compensated hold for joints 2-3, powered interception | ⏳ next |
 
@@ -35,20 +36,18 @@ eaiproject/                     Python package
   real_intercept.py             real rig: calibration loading, tracker setup, real-time planner
   robstride.py                  RobStride CAN protocol over PEAK PCAN-USB (with a motor allow-list)
   realsense_client.py           client for the RealSense frame server
-  rig_calib.py                  marker map in the arm frame: joint solver, relocalisation, checks
-  kinematics.py, markers.py, calib_board.py   FK from joint readings, ArUco markers, ChArUco board
-config/rig_map.json             the marker map (written by scripts/real/rig_solve.py)
+  rig_calib.py                  marker map in the arm frame: solver, camera pose from the map, checks
+  kinematics.py, markers.py     FK from joint readings, the table's ArUco markers
+config/rig_map.json             the marker map (written by scripts/real/calibrate.py)
 tests/                          synthetic calibration tests and a simulated rig (no hardware)
 scripts/
   sim/                          render_demo, eval_scripted, eval_tracked, live_tracking
   real/                         hardware: checks, motion tests, camera server, calibration, tracking
-    legacy/                     older calibration method (ball touches)
 assets/rebot_b601_rs/           arm model (MJCF/URDF/meshes) from Seeed + our scene XML
 docs/
   simulation.md                 sim details, env API, results
   real_rig.md                   hardware setup, step-by-step bring-up, safety, troubleshooting
   calibration_protocol.md       lab protocol for the camera-to-arm calibration
-  charuco_board_A4.pdf          optional printable calibration board
 ```
 
 ## Quick start (simulation)
@@ -87,11 +86,8 @@ scripts/real/start_camera.sh
 .venv/bin/python scripts/real/camera_view.py
 
 # 4. calibration, once: map of the table markers in the arm frame (docs/calibration_protocol.md)
-.venv/bin/python scripts/real/rig_capture.py views      # then: touch, sweep
-.venv/bin/python scripts/real/rig_solve.py              # -> config/rig_map.json
-#    every session, and after the camera moved: camera pose from the markers alone
-.venv/bin/python scripts/real/relocalize.py
-.venv/bin/python scripts/real/check_calibration.py
+.venv/bin/python scripts/real/calibrate.py              # guided: views, touches, sweep -> config/rig_map.json
+.venv/bin/python scripts/real/check_calibration.py      # live check; the camera may be moved afterwards
 
 # 5. live tracking with the arm in shadow mode
 .venv/bin/python scripts/real/real_tracking.py
@@ -119,7 +115,7 @@ disabled, so they are not moved until a gravity-compensated hold exists. Read
    the joint targets.
 4. **Calibration (real rig).** The arm's fingertips touch the corners of the table's ArUco markers
    once, which gives a map of the markers in the arm's own kinematic frame. The camera pose is then
-   recovered from the markers alone, so the camera can be moved. Heights are relative to a table
+   found from the markers alone every time a tool starts, so the camera can be moved. Heights are relative to a table
    plane measured by sliding the fingertips over it, which cancels the arm model's height bias.
 
 ## Contributing
