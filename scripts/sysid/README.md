@@ -10,6 +10,7 @@ The workflow has two steps:
    **`sim_params.json`**.
 
 Background, the safety model and troubleshooting are in [docs/sysid.md](../../docs/sysid.md).
+A one-minute walkthrough on simulated data: [docs/media/sysid_demo.mp4](../../docs/media/sysid_demo.mp4).
 
 | script | needs the arm | what it does | time |
 |---|---|---|---|
