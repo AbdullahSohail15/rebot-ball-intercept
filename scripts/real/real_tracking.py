@@ -8,6 +8,9 @@ point at 0.5 / 0.3 / 0.15 s before the ball reaches the line vs where it actuall
     scripts/real/start_camera.sh                        # camera server at the calibration resolution
     .venv/bin/python scripts/real/real_tracking.py
 
+If config/rig_map.json exists, the camera pose is re-checked against the table markers every few
+seconds (in a background thread); a red warning means the camera was moved: run relocalize.py.
+
 Keys: a  auto-tune the ball colour (ball resting alone on the table)
       w  save the colour thresholds        h  show/hide the colour-mask inset
       r  reset the tracker                 q  quit (prints the roll statistics)
@@ -17,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from eaiproject.real_intercept import (HostClock, InterceptPlanner, auto_hsv, load_calibration,  # noqa: E402
                                        load_hsv, make_tracker, save_hsv, table_z)
+from eaiproject import rig_calib  # noqa: E402
 from eaiproject.realsense_client import RealSenseClient  # noqa: E402
 
 WIN, HSV_WIN = "real tracking (shadow arm)", "HSV"
@@ -62,6 +67,10 @@ def main() -> int:
     planner = InterceptPlanner(plane)
     gx = planner.gate_x
     clock = HostClock()
+    # camera-pose watchdog: reproject the marker map with the loaded pose and compare with what is seen
+    monitor, mon_thread, mon_warned = None, None, False
+    if rig_calib.MAP_PATH.exists():
+        monitor = rig_calib.PoseMonitor(rig_calib.RigMap.load(rig_calib.MAP_PATH), calib.K, calib.dist, calib.rvec, calib.tvec)
 
     # MuJoCo shadow render
     m, d = planner.env.model, mujoco.MjData(planner.env.model)
@@ -103,6 +112,13 @@ def main() -> int:
         trk.lo, trk.hi = np.array(l, np.uint8), np.array(h, np.uint8)
 
         det = trk.process(f.img, t_cap)
+        if monitor is not None and monitor.due(now) and (mon_thread is None or not mon_thread.is_alive()):
+            monitor.t_last = now
+            mon_thread = threading.Thread(target=lambda im=f.img, t=now: monitor.update(monitor.detect(im), t), daemon=True)
+            mon_thread.start()
+        if monitor is not None and bool(monitor.warning) != mon_warned:
+            mon_warned = bool(monitor.warning)
+            print(monitor.warning or "camera pose agrees with the map again", flush=True)
         if trk.x is not None and now - (trk.t_last_meas or now) > 0.6:
             trk.reset()                                   # lost for a while: start over
         p = planner.plan(trk, now)
@@ -169,6 +185,11 @@ def main() -> int:
                 (8, 58), (255, 0, 255))
         put(img, f"SHADOW: arm not powered | jaw target z {(p.jaw[2]-table_z(plane, gx, p.jaw[1]))*1000:.0f} mm above table"
                  f" | IK err {p.ik_err*1000:.1f} mm", (8, img.shape[0] - 10), (0, 255, 255), 0.45)
+        if monitor is not None:
+            if monitor.warning:
+                put(img, monitor.warning, (8, 82), (0, 0, 255), 0.5, 2)
+            elif monitor.median_px is not None:
+                put(img, f"camera pose check: {monitor.median_px:.1f} px on {monitor.n_markers} markers", (8, 78), (160, 160, 160), 0.4)
         if msg and now - msg_t < 6:
             put(img, msg, (8, img.shape[0] - 30), (255, 255, 0), 0.45)
         if show_mask and trk.last_mask is not None:
