@@ -66,6 +66,10 @@ Before you start:
 .venv/bin/python scripts/sysid/collect.py              # type 'yes'; at the end press Enter to disable
 ```
 
+- **Our arm: joint 6 zero offset.** In the zero pose the joint-6 motor reads +333.64 deg (checked
+  25 Nov 2026), so add `--joint-offset 6=333.64` to both commands. The offset is applied to every
+  read and command and saved in `meta.json`.
+- **Plug the PCAN-USB straight into the laptop.** Behind a USB-C hub it kept disconnecting.
 - **CAN backend.** It is chosen automatically: `pcan` on macOS, `socketcan` on Linux. On Linux,
   bring the link up once per boot: `sudo ip link set can0 up type can bitrate 1000000`.
 - **Stopping.** `Ctrl+C` stops safely: the arm moves slowly back to rest, then the motors are

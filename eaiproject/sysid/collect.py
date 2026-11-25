@@ -276,7 +276,10 @@ def preflight(status: dict, arm: ArmModel, sim: bool) -> tuple[np.ndarray | None
             problems.append(f"joint{mid}: no feedback frame (cannot check scaling / temperature)")
         elif abs(s["fb_pos"] - s["pos"]) > 0.05:
             problems.append(f"joint{mid}: feedback position {s['fb_pos']:.3f} != mechPos {s['pos']:.3f} (scaling/ID?)")
-        if s["vel"] is not None and abs(s["vel"]) > 0.05:
+        if s.get("drift") is not None:
+            if abs(s["drift"]) > math.radians(0.1):
+                problems.append(f"joint{mid} moved {math.degrees(s['drift']):+.2f} deg in 0.5 s; the arm must be at rest")
+        elif s["vel"] is not None and abs(s["vel"]) > 0.05:
             problems.append(f"joint{mid} is moving ({s['vel']:+.2f} rad/s); the arm must be at rest")
         if s["iq"] is not None and abs(s["iq"]) > 0.3:
             problems.append(f"joint{mid} draws {s['iq']:+.2f} A: is it already enabled by another program?")
@@ -287,7 +290,8 @@ def preflight(status: dict, arm: ArmModel, sim: bool) -> tuple[np.ndarray | None
         lo, hi = arm.range[j]
         if not (lo - 0.1 <= s["pos"] <= hi + 0.1):
             problems.append(f"joint{mid} reads {math.degrees(s['pos']):+.1f} deg, outside the model range "
-                            f"[{math.degrees(lo):+.1f}, {math.degrees(hi):+.1f}] -> zero offset? run joint_check.py")
+                            f"[{math.degrees(lo):+.1f}, {math.degrees(hi):+.1f}] -> zero offset? run joint_check.py, "
+                            f"then pass --joint-offset {mid}=<reading in the zero pose, deg>")
     return (None if np.isnan(q).any() else q), problems, warns
 
 

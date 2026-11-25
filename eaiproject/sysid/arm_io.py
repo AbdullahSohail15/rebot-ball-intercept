@@ -43,8 +43,11 @@ def _empty() -> Feedback:
 class RealArm:
     is_sim = False
 
-    def __init__(self, interface: str | None = None, channel: str | None = None, allow_motion: bool = True):
+    def __init__(self, interface: str | None = None, channel: str | None = None, allow_motion: bool = True,
+                 offset=None):
         self.rs = RobStrideBus(channel, interface=interface, movable=MOTOR_IDS if allow_motion else ())
+        # motor reading = model angle + offset (rad); applied to every read and every command
+        self.offset = np.zeros(N) if offset is None else np.asarray(offset, float)
         self.orig: dict[int, dict] = {}
         self.enabled = False
 
@@ -69,6 +72,10 @@ class RealArm:
         for mid in (*MOTOR_IDS, GRIPPER_ID):
             st[mid] = {"pos": rs.read_param_f32(mid, P_MECHPOS), "vel": rs.read_param_f32(mid, P_MECHVEL),
                        "iq": rs.read_param_f32(mid, P_IQF), "vbus": rs.read_param_f32(mid, P_VBUS)}
+        time.sleep(0.5)   # at-rest check from the position change (the velocity reading is noisy, ~0.08 rad/s)
+        for mid in MOTOR_IDS:
+            p2 = rs.read_param_f32(mid, P_MECHPOS)
+            st[mid]["drift"] = None if p2 is None or st[mid]["pos"] is None else p2 - st[mid]["pos"]
         for mid in MOTOR_IDS:
             st[mid]["run_mode"] = rs.read_param_u8(mid, P_RUN_MODE)
             st[mid]["limit_torque"] = rs.read_param_f32(mid, P_LIMIT_TORQUE)
@@ -81,6 +88,11 @@ class RealArm:
             fb = rs.last_fb.get(mid)
             st[mid].update(fb_pos=None if fb is None else fb.pos, temp=None if fb is None else fb.temp_c,
                            faults=None if fb is None else fb.faults, mode=None if fb is None else fb.mode)
+        for j, mid in enumerate(MOTOR_IDS):
+            st[mid]["raw_pos"] = st[mid]["pos"]
+            for k in ("pos", "fb_pos"):
+                if st[mid][k] is not None:
+                    st[mid][k] -= self.offset[j]
         return st
 
     def prepare(self, torque_cap: np.ndarray | None) -> None:
@@ -108,7 +120,7 @@ class RealArm:
 
     def enable(self, q_hold: np.ndarray, kp: np.ndarray, kd: np.ndarray) -> None:
         for j, mid in enumerate(MOTOR_IDS):
-            self.rs.mit(mid, float(q_hold[j]), float(kp[j]), float(kd[j]))   # hold target queued first
+            self.rs.mit(mid, float(q_hold[j] + self.offset[j]), float(kp[j]), float(kd[j]))   # hold target queued first
         self.rs.drain(0.005)
         for mid in MOTOR_IDS:
             self.rs.enable(mid)
@@ -119,7 +131,7 @@ class RealArm:
         rs = self.rs
         t_send = time.monotonic()
         for j, mid in enumerate(MOTOR_IDS):
-            rs.mit(mid, float(q[j]), float(kp[j]), float(kd[j]), float(qd[j]), float(tau[j]))
+            rs.mit(mid, float(q[j] + self.offset[j]), float(kp[j]), float(kd[j]), float(qd[j]), float(tau[j]))
         got: set[int] = set()
         deadline = t_send + 0.004
         while len(got) < N:
@@ -133,7 +145,8 @@ class RealArm:
         for j, mid in enumerate(MOTOR_IDS):
             f = rs.last_fb.get(mid)
             if f is not None and f.t >= t_send:
-                fb.q[j], fb.v[j], fb.tau[j], fb.temp[j], fb.fault[j], fb.t[j] = f.pos, f.vel, f.tau, f.temp_c, f.faults, f.t
+                fb.q[j], fb.v[j], fb.tau[j], fb.temp[j], fb.fault[j], fb.t[j] = (f.pos - self.offset[j], f.vel, f.tau,
+                                                                                  f.temp_c, f.faults, f.t)
         return fb
 
     def disable(self) -> None:

@@ -51,11 +51,17 @@ def main() -> int:
     ap.add_argument("--sim-start", type=float, nargs=6, default=[0, 0, 0, 0, 0, 0], help="sim: start pose, rad")
     ap.add_argument("--inject", default="none", choices=["none", "track", "lost"],
                     help="sim: inject a disturbance (track: push on joint 2) or lost feedback at t = 100 s")
+    ap.add_argument("--joint-offset", action="append", default=[], metavar="J=DEG",
+                    help="real arm: motor joint J reads DEG in the model's zero pose (repeatable), e.g. 6=333.64")
     ap.add_argument("--out", default=None, help="output directory (default outputs/sysid/<time>)")
     args = ap.parse_args()
     args.scale = min(max(args.scale, 0.2), 1.2)
     args.fmax = min(max(args.fmax, 0.5), 8.0)
     kp, kd = KP_DEFAULT.copy(), KD_DEFAULT.copy()
+    offset = np.zeros(6)
+    for item in args.joint_offset:
+        j, deg = item.split("=")
+        offset[int(j) - 1] = np.radians(float(deg))
     cap = MOTOR_TORQUE_MAX.copy() if args.no_torque_cap else np.minimum(np.array(args.torque_cap), MOTOR_TORQUE_MAX)
 
     arm = ArmModel()
@@ -65,7 +71,8 @@ def main() -> int:
     else:
         from eaiproject.sysid.arm_io import RealArm
         try:
-            io = RealArm(None if args.can == "auto" else args.can, args.channel, allow_motion=not args.dry_run)
+            io = RealArm(None if args.can == "auto" else args.can, args.channel, allow_motion=not args.dry_run,
+                        offset=offset)
         except Exception as e:  # noqa: BLE001
             print(f"Cannot open the CAN adapter: {e}\n"
                   "  macOS: PCAN-USB plugged in, libPCBUSB in ~/lib (docs/real_rig.md).\n"
@@ -124,6 +131,7 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
         rec = Recorder()
         meta = base_meta(args, args.sim, io.link)
+        meta["joint_offset_deg"] = np.degrees(offset).round(3).tolist()
         meta.update(kp=kp, kd=kd, torque_cap=cap, q_start=q_start, preflight=status, safety=vars(safety),
                     planned_excitation=[s.name for s in segs if s.kind == "excite"],
                     plan_check={"peak_tau": chk.peak_tau, "peak_vel": chk.peak_vel, "track_err": chk.track_err})
