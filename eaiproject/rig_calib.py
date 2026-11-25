@@ -1,16 +1,13 @@
-"""Camera-to-arm calibration that survives camera moves: a static map of the table markers in the
-arm's KINEMATIC base frame, plus relocalisation of the camera against that map.
+"""Camera-to-arm calibration that survives camera moves.
 
-    static (once):   multi-view marker photos + fingertip touches on marker corners + a fingertip
-                     sweep of the table  ->  solve_rig()  ->  RigMap (config/rig_map.json)
-    online (always): one PnP on all visible table-marker corners against the map -> relocalize()
+    once:    photos of the table markers from several camera positions + fingertip touches on
+             marker corners + a fingertip sweep of the table  ->  solve_rig()  ->  RigMap
+             (config/rig_map.json: marker corners and the table plane in the arm's frame)
+    always:  locate(): one PnP on all visible marker corners against the map -> camera pose
 
-"Kinematic frame" means the frame of eaiproject.kinematics.Fingertip (MuJoCo FK from joint
-readings). The model reads heights 8-15 mm off, and measuring with the arm's own FK absorbs that,
-because the planner commands targets through the same model.
-
-Only the TABLE markers are used (keys starting with TABLE_PREFIX in eaiproject/markers.py, the
-single source of truth for dictionaries, IDs and sizes). The plate markers are ignored everywhere.
+Everything is in the arm's KINEMATIC frame: positions as eaiproject.kinematics.Fingertip reports
+them (MuJoCo FK from joint readings). The model reads heights 8-15 mm off; measuring with the arm's
+own FK absorbs that, because the planner commands targets through the same model.
 
 Geometry conventions
     table plane      z = a + b x + c y in the base frame; the normal n points up (+z side)
@@ -20,7 +17,7 @@ Geometry conventions
     camera           OpenCV: X_cam = R(rvec) X_base + tvec
     ball             centre on the plane table + r, on the camera's side (r > 0 along n)
 
-Pure functions, no hardware imports.
+Markers (IDs, sizes, detection) are defined in eaiproject/markers.py. Pure functions, no hardware.
 """
 from __future__ import annotations
 
@@ -37,12 +34,11 @@ from . import markers as _markers
 
 ROOT = Path(__file__).resolve().parents[1]
 MAP_PATH = ROOT / "config" / "rig_map.json"                 # committed: marker corners in the arm frame
-CAL_DIR = ROOT / "outputs" / "calibration"                  # camera_extrinsics.json, table_height.json
+OUT_DIR = ROOT / "outputs" / "calibration"                  # logs: last camera pose, check screenshots, validation.csv
 SESSIONS_DIR = ROOT / "outputs" / "rig_calib"               # raw observations per capture session (git-ignored)
 GATE_X = 0.40                                               # intercept line of the "forward" mode
 BLOCK_TILT_DEG = 30.0                                       # gripper tilt of the blocking pose
 
-TABLE_PREFIX = "orig:"            # table markers; "4x4:" are the plate markers (not used)
 CORNER_NAMES = ("TL", "TR", "BR", "BL", "C")
 CENTRE = 4
 BALL_R = 0.022
@@ -65,99 +61,10 @@ class CalibrationError(ValueError):
 
 
 # --------------------------------------------------------------------------------- markers
-def is_table(key: str) -> bool:
-    return key.startswith(TABLE_PREFIX)
-
-
-def table_sizes(sizes: dict | None = None) -> dict[str, float]:
-    """Table markers and their side length (m), from eaiproject/markers.py."""
-    return {k: float(s) for k, s in (_markers.SIZES if sizes is None else sizes).items() if is_table(k)}
-
-
-def table_only(found: dict, sizes: dict | None = None) -> dict:
-    """Keep only known table markers from a markers.detect() result."""
-    known = table_sizes(sizes)
-    return {k: np.asarray(v, float).reshape(4, 2) for k, v in found.items() if k in known}
-
-
 def local_corners(size: float) -> np.ndarray:
     """(5, 2): TL, TR, BR, BL, centre in the marker's own frame (x right, y up)."""
     h = size / 2
     return np.array([[-h, h], [h, h], [h, -h], [-h, -h], [0.0, 0.0]])
-
-
-def _refine(gray: np.ndarray, corners, modules: int = 7, max_shift: float = 3.0, passes: int = 2) -> np.ndarray | None:
-    """Marker corners from straight lines fitted to the marker's four outer edges.
-
-    The detector's cornerSubPix pulls the corner of a blurred black square inwards (0.3-0.8 px in
-    our images), so markers look 1-3 % too small and a map built from them is stretched by several
-    mm at the far markers. Edge positions found across each side (gradient centroid) do not have
-    that bias; the corners are the intersections of the four fitted lines. `modules`: marker width
-    in cells incl. the black border (7 for DICT_ARUCO_ORIGINAL), which limits the search band so it
-    never reaches the first inner cell. Returns None if anything looks wrong.
-    """
-    c0 = np.asarray(corners, np.float64).reshape(4, 2)
-    c = c0
-    for _ in range(passes):
-        ctr, lines = c.mean(axis=0), []
-        for i in range(4):
-            a, b = c[i], c[(i + 1) % 4]
-            L = float(np.linalg.norm(b - a))
-            if L < 10:
-                return None
-            t = (b - a) / L
-            nrm = np.array([-t[1], t[0]])
-            if nrm @ (ctr - a) > 0:
-                nrm = -nrm                                             # pointing out of the marker
-            depth = 2 * abs(float(nrm @ (ctr - a)))                    # marker extent across this side (foreshortened)
-            half = float(np.clip(0.6 * depth / modules, 1.0, 4.0))
-            offs = np.arange(-half - 1, half + 1.01, 0.5)              # samples across the edge
-            base = a + np.linspace(0.15, 0.85, max(6, int(L * 0.7 / 1.5)))[:, None] * (b - a)
-            pts = (base[:, None, :] + offs[None, :, None] * nrm).astype(np.float32)
-            prof = cv2.remap(gray, pts[..., 0], pts[..., 1], cv2.INTER_LINEAR).astype(np.float64)
-            g = np.clip(np.diff(prof, axis=1), 0, None)                # black -> white going outwards
-            wsum = g.sum(axis=1)
-            ok = wsum > 0.25 * np.median(wsum)
-            if np.median(wsum) <= 0 or ok.sum() < 4:
-                return None
-            e = (g[ok] * (0.5 * (offs[:-1] + offs[1:]))).sum(axis=1) / wsum[ok]
-            vx, vy, x0, y0 = cv2.fitLine((base[ok] + e[:, None] * nrm).astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
-            lines.append((np.array([x0, y0], float), np.array([vx, vy], float)))
-        out = np.empty((4, 2))
-        for i in range(4):
-            (p1, d1), (p2, d2) = lines[i - 1], lines[i]
-            A = np.column_stack([d1, -d2])
-            if abs(np.linalg.det(A)) < 1e-6:
-                return None
-            out[i] = p1 + np.linalg.solve(A, p2 - p1)[0] * d1
-        if not np.all(np.isfinite(out)) or np.abs(out - c0).max() > max_shift:
-            return None
-        c = out
-    return c
-
-
-def refine_corners(gray: np.ndarray, corners, **kw) -> np.ndarray:
-    """Edge-refined corners (see _refine); the input unchanged when the refinement fails."""
-    out = _refine(gray, corners, **kw)
-    return np.asarray(corners, np.float64).reshape(4, 2) if out is None else out
-
-
-def _edge_contrast(gray: np.ndarray, c: np.ndarray, modules: int = 7) -> float:
-    """Mean grey level just outside the quad minus just inside it: large and positive for a real
-    marker (white margin around a black border), small when something covers it."""
-    ctr, diff = c.mean(axis=0), []
-    for i in range(4):
-        a, b = c[i], c[(i + 1) % 4]
-        t = (b - a) / max(float(np.linalg.norm(b - a)), 1e-9)
-        nrm = np.array([-t[1], t[0]])
-        if nrm @ (ctr - a) > 0:
-            nrm = -nrm
-        d = max(1.0, abs(float(nrm @ (ctr - a))) / modules)          # half a border width
-        base = a + np.linspace(0.2, 0.8, 8)[:, None] * (b - a)
-        pts = np.stack([base + d * nrm, base - d * nrm]).astype(np.float32)
-        v = cv2.remap(gray, pts[..., 0], pts[..., 1], cv2.INTER_LINEAR).astype(float)
-        diff.append(v[0].mean() - v[1].mean())
-    return float(min(diff))
 
 
 def guided_corners(gray: np.ndarray, rig_map: "RigMap", K, dist, rvec, tvec, have=(), min_side_px: float = 10.0,
@@ -182,27 +89,17 @@ def guided_corners(gray: np.ndarray, rig_map: "RigMap", K, dist, rvec, tvec, hav
         sides = np.linalg.norm(pred - np.roll(pred, -1, axis=0), axis=1)
         if sides.min() < min_side_px or pred.min() < 6 or pred[:, 0].max() > w - 7 or pred[:, 1].max() > h - 7:
             continue
-        c = _refine(gray, pred, max_shift=max_shift)
-        if c is not None and _edge_contrast(gray, c) >= min_contrast:
+        c = _markers.fit_edges(gray, pred, max_shift=max_shift)
+        if c is not None and _markers.edge_contrast(gray, c) >= min_contrast:
             out[k] = c
     return out
 
 
-def detect_table(img_bgr: np.ndarray, sizes: dict | None = None) -> dict[str, np.ndarray]:
-    """Table markers in an image with edge-refined corners: key -> (4, 2). Use this (not the raw
-    markers.detect) for everything that builds or uses the rig map, so both see the same corners."""
-    found = table_only(_markers.detect(img_bgr), sizes)
-    if not found:
-        return found
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    return {k: refine_corners(gray, c) for k, c in found.items()}
-
-
 def detect_with_map(img_bgr: np.ndarray, rig_map: "RigMap", K, dist, pose=None) -> tuple[dict, list]:
-    """detect_table() plus guided_corners() for the map markers it missed. `pose` = (rvec, tvec) to
+    """markers.detect() plus guided_corners() for the map markers it missed. `pose` = (rvec, tvec) to
     predict from; None = a PnP on the markers detected in this image (needs 2 of them).
     Returns (key -> corners, keys that were found by prediction)."""
-    found = {k: c for k, c in detect_table(img_bgr, rig_map.sizes).items() if k in rig_map.markers}
+    found = {k: c for k, c in _markers.detect(img_bgr).items() if k in rig_map.markers}
     if pose is None:
         if len(found) < 2:
             return found, []
@@ -310,7 +207,7 @@ def fit_quadratic(P: np.ndarray, plane) -> dict:
 
 # ----------------------------------------------------------------------------------- sweep
 def tilt_deg(R) -> np.ndarray:
-    """Downward tilt of the fingers (gripper_end x axis) in degrees, as shown by table_height.py."""
+    """Downward tilt of the fingers (gripper_end x axis) in degrees (+ = pointing down)."""
     R = np.asarray(R, float).reshape(-1, 3, 3)
     return np.degrees(np.arcsin(np.clip(-R[:, 2, 0], -1.0, 1.0)))
 
@@ -432,7 +329,7 @@ class Observations:
     views: list
     touches: list
     sweep: np.ndarray = field(default_factory=lambda: np.zeros((0, 3)))    # filtered, gridded
-    sizes: dict = field(default_factory=table_sizes)
+    sizes: dict = field(default_factory=lambda: dict(_markers.SIZES))
     sources: dict = field(default_factory=dict)
 
 
@@ -475,7 +372,7 @@ class RigMap:
 
     @staticmethod
     def from_json(d: dict) -> "RigMap":
-        mk = {k: np.array(m["corners"], float) for k, m in d["markers"].items() if is_table(k)}
+        mk = {k: np.array(m["corners"], float) for k, m in d["markers"].items()}
         return RigMap(markers=mk, plane=np.array(d["plane_z=a+bx+cy"], float),
                       sizes={k: float(d["markers"][k]["size"]) for k in mk},
                       touched={k: [CORNER_NAMES.index(n) for n in d["markers"][k]["touched_corners"]] for k in mk
@@ -490,14 +387,14 @@ class RigMap:
 
 def load_observations(session_dir, ref_tilt_deg: float | None = None, max_dev_deg: float = 5.0,
                       grid: float = 0.02) -> tuple[Observations, dict]:
-    """Read what scripts/real/rig_capture.py saved (views.json, touches.json, sweep.npz)."""
+    """Read what scripts/real/calibrate.py saved (views.json, touches.json, sweep.npz)."""
     d = Path(session_dir)
-    sizes = table_sizes()
+    sizes = dict(_markers.SIZES)
     views, touches, sweep, stats = [], [], np.zeros((0, 3)), {}
     if (d / "views.json").exists():
         for v in json.loads((d / "views.json").read_text())["views"]:
             views.append(View(v["name"], np.array(v["K"], float), np.array(v["dist"], float), v["width"], v["height"],
-                              table_only({k: np.array(c, float) for k, c in v["corners"].items()}, sizes)))
+                              {k: np.array(c, float) for k, c in v["corners"].items() if k in sizes}))
     if (d / "touches.json").exists():
         for t in json.loads((d / "touches.json").read_text())["touches"]:
             if t["key"] in sizes:
@@ -752,6 +649,13 @@ def solve_rig(obs: Observations, far_dist: float = FAR_DIST, leave_one_out: bool
         warn.append(f"no marker is farther than {far_dist:.2f} m from the base: relocalisation will refuse "
                     "(it needs one far marker); lower far_dist or add a marker further out")
 
+    if len(obs.sweep) >= 30:
+        surf = fit_quadratic(obs.sweep, plane)
+        report["surface"] = surf
+        if surf["significant"]:
+            warn.append(f"the swept surface is curved by {surf['bend_mm']:.1f} mm in the arm's frame (model error); the planner "
+                        "uses the plane. The quadratic fit is saved in the map (stats.surface) if you want to use it")
+
     if leave_one_out:
         loo = {}
         for k in touched_keys:
@@ -782,32 +686,11 @@ def solve_rig(obs: Observations, far_dist: float = FAR_DIST, leave_one_out: bool
                      stats={k: report[k] for k in ("n_views", "n_markers", "n_touches", "n_sweep_points", "reproj_rms_px",
                                                    "per_marker_reproj_px", "touch_rms_mm", "touch_xy_rms_mm",
                                                    "touch_dz_mean_mm", "touch_scale_percent", "sweep_rms_mm", "touch_geometry")}
-                     | ({"leave_one_marker_out": report["leave_one_marker_out"]} if leave_one_out else {}),
+                     | {k: report[k] for k in ("leave_one_marker_out", "surface") if k in report},
                      warnings=list(warn), sources=dict(obs.sources))
     report["warnings"] = warn
     return RigSolution(rig_map, {v.name: (c[:3].copy(), c[3:].copy()) for v, c in zip(obs.views, cams)}, report, warn,
                        np.array([t.p for t in touches]), touch, sweep, x)
-
-
-def table_height_dict(sweep: np.ndarray, gate_x: float = 0.40, extra_points: np.ndarray | None = None) -> dict:
-    """Contents of table_height.json in the format real_intercept.load_calibration() reads
-    ("plane_z=a+bx+cy"), fitted to the sweep (or to `extra_points` when there is no sweep).
-    A quadratic surface is added as an extra field only when the residuals show smooth curvature."""
-    src = "sweep" if len(sweep) >= 10 else "corner touches"
-    P = np.asarray(sweep if len(sweep) >= 10 else extra_points, float).reshape(-1, 3)
-    coef, res = fit_plane(P)
-    a, b, c = coef
-    out = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "source": f"rig_solve.py ({src})",
-           "plane_z=a+bx+cy": coef.tolist(), "n_points": len(P),
-           "residual_rms_mm": round(float(np.sqrt(np.mean(res ** 2))) * 1000, 2),
-           "z_at_gate_mm": {f"{y:+.2f}": round(float(a + b * gate_x + c * y) * 1000, 1) for y in (-0.24, -0.12, 0.0, 0.12, 0.24)},
-           "gate_x": gate_x,
-           "tilt_deg_x_y": [round(float(np.degrees(np.arctan(b))), 2), round(float(np.degrees(np.arctan(c))), 2)]}
-    quad = fit_quadratic(P, coef)
-    out["curvature"] = {k: quad[k] for k in ("rms_plane_mm", "rms_quadratic_mm", "bend_mm", "significant")}
-    if quad["significant"]:
-        out["quadratic_z=a+bx+cy+dxx+exy+fyy"] = quad["coef"]       # NOT read by the planner (yet)
-    return out
 
 
 # -------------------------------------------------------------------------- relocalisation
@@ -823,6 +706,8 @@ class Reloc:
     table_rms_mm: float
     camera_position: np.ndarray
     guided: list = field(default_factory=list)      # markers located by prediction (guided_corners)
+    corners: dict = field(default_factory=dict)     # the corner pixels the pose was fitted to
+    jitter_px: float = 0.0                          # largest corner movement while averaging (locate)
 
     @property
     def status(self) -> str:
@@ -863,7 +748,7 @@ def relocalize(rig_map: RigMap, K, dist, detections: dict, min_markers: int = 3,
     """
     seen = {k: np.asarray(c, float).reshape(4, 2) for k, c in detections.items() if k in rig_map.markers}
     extra = {k: np.asarray(c, float).reshape(4, 2) for k, c in (guided or {}).items() if k in rig_map.markers and k not in seen}
-    unknown = sorted(k for k in detections if is_table(k) and k not in rig_map.markers)
+    unknown = sorted(k for k in detections if k not in rig_map.markers)
 
     def check_ids(keys):
         if len(keys) < min_markers:
@@ -912,26 +797,38 @@ def relocalize(rig_map: RigMap, K, dist, detections: dict, min_markers: int = 3,
     e_mm = np.linalg.norm(backproject_to_plane(K, dist, rvec, tvec, rig_map.plane, allc)
                           - np.concatenate([rig_map.markers[k] for k in keys]), axis=1) * 1000
     return Reloc(rvec, tvec, keys, rejected, px, mm, float(np.sqrt(np.mean(e_px ** 2))),
-                 float(np.sqrt(np.mean(e_mm ** 2))), C, sorted(k for k in keys if k in extra))
+                 float(np.sqrt(np.mean(e_mm ** 2))), C, sorted(k for k in keys if k in extra), {k: seen[k] for k in keys})
 
 
-def extrinsics_dict(res: Reloc, rig_map: RigMap, K, dist, width: int, height: int, table_ref_xy=(0.56, 0.01),
-                    serial: str | None = None, ball_r: float = BALL_R) -> dict:
-    """camera_extrinsics.json in the format real_intercept.load_calibration() reads. K / dist must be
-    those of the stream the tracker runs on (the file is only valid at this resolution)."""
-    pixel_to_ball_xy(K, dist, res.rvec, res.tvec, rig_map.plane, [[width / 2, height / 2]], ball_r)   # sign check
-    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "method": "relocalize.py (PnP on config/rig_map.json)",
-            "rig_map_time": rig_map.time, "camera_serial": serial, "width": int(width), "height": int(height),
-            "K": np.asarray(K, float).tolist(), "dist": np.asarray(dist, float).ravel().tolist(), "ball_r": ball_r,
-            "rvec": res.rvec.tolist(), "tvec": res.tvec.tolist(),
-            "camera_position_robot_frame": res.camera_position.tolist(),
-            "table_z": float(plane_z(rig_map.plane, *table_ref_xy)),
-            "plane_z=a+bx+cy": [float(v) for v in rig_map.plane],
-            "markers_used": res.used, "markers_guided": res.guided, "markers_rejected": res.rejected,
+def locate(rig_map: RigMap, K, dist, images: list, min_markers: int = 3, require_far: bool = True) -> Reloc:
+    """Camera pose from a short burst of frames (BGR) of a camera that stands still.
+
+    Corners are averaged over the frames (corners, not poses), one PnP gives a first pose from the
+    markers the detector read, the remaining map markers are then looked for where that pose
+    predicts them, and the PnP is repeated with everything. Raises CalibrationError when it cannot
+    be trusted (see relocalize) or when the pose would break the ball-plane convention.
+    """
+    mean, jitter = average_corners([_markers.detect(im) for im in images])
+    res = relocalize(rig_map, K, dist, mean, min_markers, require_far)
+    grays = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images]
+    extra, j2 = average_corners([guided_corners(g, rig_map, K, dist, res.rvec, res.tvec, have=mean) for g in grays])
+    if extra:
+        res = relocalize(rig_map, K, dist, mean, min_markers, require_far, guided=extra)
+    res.jitter_px = max([0.0, *jitter.values(), *j2.values()])
+    h, w = grays[0].shape
+    pixel_to_ball_xy(K, dist, res.rvec, res.tvec, rig_map.plane, [[w / 2, h / 2]])       # sign convention check
+    return res
+
+
+def pose_dict(res: Reloc, rig_map: RigMap, K, dist, width: int, height: int, serial: str | None = None) -> dict:
+    """A relocalisation as JSON, for the log (outputs/calibration/camera_pose.json)."""
+    return {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "rig_map_time": rig_map.time, "camera_serial": serial,
+            "width": int(width), "height": int(height), "K": np.asarray(K, float).tolist(),
+            "dist": np.asarray(dist, float).ravel().tolist(), "rvec": res.rvec.tolist(), "tvec": res.tvec.tolist(),
+            "camera_position": res.camera_position.tolist(), "status": res.status,
             "reproj_rms_px": round(res.reproj_rms_px, 3), "table_rms_mm": round(res.table_rms_mm, 2),
             "per_marker_reproj_px": {k: round(v, 3) for k, v in res.per_marker_px.items()},
-            "status": res.status,
-            "touches_robot": {}}          # kept so the older table_height.py still loads this file
+            "markers_used": res.used, "markers_guided": res.guided, "markers_rejected": res.rejected}
 
 
 class PoseMonitor:
@@ -967,19 +864,10 @@ class PoseMonitor:
     def warning(self) -> str | None:
         if self.bad >= 2:
             return (f"CAMERA MOVED? markers are {self.median_px:.1f} px off the map (limit {self.warn_px} px): "
-                    "run scripts/real/relocalize.py")
+                    "press c to locate the camera again")
         return None
 
 
 def latest_session() -> Path | None:
     ds = [d for d in SESSIONS_DIR.glob("*") if d.is_dir() and any((d / f).exists() for f in ("views.json", "touches.json"))]
     return max(ds, key=lambda d: d.stat().st_mtime) if ds else None
-
-
-def write_json_with_backup(path, data: dict) -> None:
-    """Write JSON; an existing file is kept next to it as <name>.prev.json."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        path.replace(path.with_suffix(".prev.json"))
-    path.write_text(json.dumps(data, indent=2) + "\n")

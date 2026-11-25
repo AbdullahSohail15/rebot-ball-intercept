@@ -45,7 +45,7 @@ class Rig:
         self.plane = np.array([0.006 + BIAS[2], r.uniform(-0.004, 0.004), r.uniform(-0.004, 0.004)])
         near = [(0.30, -0.22), (0.32, 0.20), (0.46, -0.02)][:n_near]
         far = [(0.78, -0.20), (0.90, 0.18), (0.70, 0.05)][:n_far]
-        self.sizes = {f"orig:{100 + i}": SIZE for i in range(n_near + n_far)}
+        self.sizes = {str(100 + i): SIZE for i in range(n_near + n_far)}
         self.keys = list(self.sizes)
         self.near = self.keys[:n_near]
         self.truth = {}
@@ -89,17 +89,14 @@ class Rig:
         rv, tv = self.camera()
         det = self.detect(rv, tv, K_VGA, (640, 480), 0.2)
         res = rc.relocalize(rig_map, K_VGA, DIST, det)
-        ext = rc.extrinsics_dict(res, rig_map, K_VGA, DIST, 640, 480)
-        o, _, _, n = rc.plane_frame(self.plane)
         errs = []
         for x, y in points_xy:
             centre = rc.from_plane(self.plane, rc.to_plane(self.plane, [[x, y, 0]])[0], rc.BALL_R)[0]   # true ball centre
             uv = rc.project(K_VGA, DIST, rv, tv, centre)
             if tracker:                                   # the exact path real_tracking.py uses
-                from eaiproject.ball_tracker import BallTracker, CameraCalib
-                from eaiproject.real_intercept import TABLE_XY, shifted
-                calib = CameraCalib(np.array(ext["K"]), np.array(ext["dist"]), np.array(ext["rvec"]), np.array(ext["tvec"]), 640, 480)
-                trk = BallTracker(shifted(calib, ext["table_z"]), ball_r=ext["ball_r"], table_xy=TABLE_XY, bgr=True)
+                from eaiproject.ball_tracker import CameraCalib
+                from eaiproject.real_intercept import make_tracker
+                trk = make_tracker(CameraCalib(K_VGA, DIST, res.rvec, res.tvec, 640, 480), rig_map.plane, hsv=((0, 0, 0), (1, 1, 1)))
                 xy = trk.pixel_to_world(uv[0])
             else:
                 xy = rc.pixel_to_ball_xy(K_VGA, DIST, res.rvec, res.tvec, rig_map.plane, uv)[0]
@@ -168,13 +165,13 @@ class SolverTest(unittest.TestCase):
         print(f"\n  max ball-plane error over 5 seeds (new camera pose, 640x480): {worst:.2f} mm")
 
     def test_ball_through_the_real_tracker_path(self):
-        """Same check through CameraCalib + shifted() + BallTracker, as real_tracking.py does: this is
-        the end-to-end sign convention (table + r on the camera's side). The tracker treats the table as
-        level at its mean height, so on a tilted plane it is slightly worse than the exact projection."""
-        rig = Rig(3)
-        m = rc.solve_rig(rig.observations(rig.near), leave_one_out=False).rig_map
-        e = rig.ball_errors_mm(m, LANE, tracker=True)
-        self.assertLess(e.max(), 5.0, f"tracker-path error {e.max():.2f} mm")
+        """Same check through make_tracker() + BallTracker, as real_tracking.py does: the end-to-end
+        sign convention (table + r on the camera's side), on the tilted table plane."""
+        for seed in range(5):
+            rig = Rig(seed)
+            m = rc.solve_rig(rig.observations(rig.near), leave_one_out=False).rig_map
+            e = rig.ball_errors_mm(m, LANE, tracker=True)
+            self.assertLess(e.max(), 3.0, f"tracker-path error {e.max():.2f} mm")
 
     def test_two_touched_markers(self):
         for seed in range(5):
@@ -191,13 +188,6 @@ class SolverTest(unittest.TestCase):
         for v in obs.views[:3]:
             v.corners.pop(rig.keys[-1], None)
         self.assertLess(rig.corner_errors_mm(rc.solve_rig(obs, leave_one_out=False).rig_map).max(), 2.0)
-
-    def test_plate_markers_are_ignored(self):
-        rig = Rig(0)
-        obs = rig.observations(rig.near)
-        obs.views[0].corners["4x4:0"] = np.array([[10, 10], [60, 10], [60, 60], [10, 60.0]])
-        self.assertNotIn("4x4:0", rc.solve_rig(obs, leave_one_out=False).rig_map.markers)
-        self.assertEqual(rc.table_only({"4x4:0": np.zeros((4, 2)), "orig:107": np.zeros((4, 2))}).keys(), {"orig:107"})
 
 
 class WarningsAndFailuresTest(unittest.TestCase):
@@ -251,8 +241,10 @@ class WarningsAndFailuresTest(unittest.TestCase):
         res = rc.relocalize(m, K_VGA, DIST, rig.detect(rv, tv, K_VGA, (640, 480), 0.2))
         with self.assertRaisesRegex(rc.CalibrationError, "radius must be positive"):
             rc.pixel_to_ball_xy(K_VGA, DIST, res.rvec, res.tvec, m.plane, [[320, 240]], r=-rc.BALL_R)
-        with self.assertRaises(rc.CalibrationError):
-            rc.extrinsics_dict(res, m, K_VGA, DIST, 640, 480, ball_r=-rc.BALL_R)
+        from eaiproject.ball_tracker import CameraCalib
+        from eaiproject.real_intercept import on_table
+        with self.assertRaisesRegex(rc.CalibrationError, "not above"):          # the tracker refuses a camera under the table
+            on_table(CameraCalib(K_VGA, DIST, res.rvec, res.tvec, 640, 480), [2.0, 0, 0])
         flipped = -np.asarray(m.plane)                         # a plane whose "up" is away from the camera
         with self.assertRaisesRegex(rc.CalibrationError, "from above"):
             rc.pixel_to_ball_xy(K_VGA, DIST, res.rvec, res.tvec, [flipped[0] + 2.0, 0, 0], [[320, 240]])
@@ -288,17 +280,23 @@ class SweepTest(unittest.TestCase):
         self.assertLessEqual(len(pts), 11 * 21)
         self.assertLess(np.abs(pts[:, 2] - 0.012).max(), 0.002)
 
-    def test_table_height_format_and_curvature(self):
+    def test_curved_surface_is_reported(self):
         rng = np.random.default_rng(1)
         xs, ys = np.meshgrid(np.arange(0.26, 0.56, 0.02), np.arange(-0.26, 0.27, 0.02))
         x, y = xs.ravel(), ys.ravel()
         flat = np.c_[x, y, 0.010 + 0.003 * x - 0.002 * y + rng.normal(0, 0.0008, len(x))]
-        d = rc.table_height_dict(flat)
-        np.testing.assert_allclose(d["plane_z=a+bx+cy"], [0.010, 0.003, -0.002], atol=1.5e-3)
-        self.assertNotIn("quadratic_z=a+bx+cy+dxx+exy+fyy", d)
+        self.assertFalse(rc.fit_quadratic(flat, rc.fit_plane(flat)[0])["significant"])
         bent = flat.copy()
         bent[:, 2] += 0.08 * y ** 2                         # 5 mm sag at |y| = 0.25
-        self.assertIn("quadratic_z=a+bx+cy+dxx+exy+fyy", rc.table_height_dict(bent))
+        q = rc.fit_quadratic(bent, rc.fit_plane(bent)[0])
+        self.assertTrue(q["significant"])
+        self.assertGreater(q["bend_mm"], 3.0)
+        rig = Rig(0)
+        obs = rig.observations(rig.near)
+        obs.sweep[:, 2] += 0.08 * obs.sweep[:, 1] ** 2
+        sol = rc.solve_rig(obs, leave_one_out=False)
+        self.assertTrue(any("curved" in w for w in sol.warnings), sol.warnings)
+        self.assertTrue(sol.rig_map.stats["surface"]["significant"])
 
 
 if __name__ == "__main__":
