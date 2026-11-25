@@ -7,8 +7,8 @@ No learned detector. Per frame:
 
 The same class is meant to run on the real camera: only the calibration (K, dist, rvec,
 tvec) and the HSV thresholds change. In the sim, `camera_from_mujoco` gives the exact
-calibration of a MuJoCo camera; on the real rig use `calibrate_extrinsics` (solvePnP on
-table points with known robot-frame coordinates) after a checkerboard intrinsic calibration.
+calibration of a MuJoCo camera; on the real rig the pose comes from the table markers
+(eaiproject/rig_calib.py, real_intercept.locate_camera) and the RealSense factory intrinsics.
 
 Coordinates: robot/world frame, z = 0 is the tabletop, the ball centre is at z = r.
 Images are RGB (what mujoco.Renderer returns); pass `bgr=True` for OpenCV camera frames.
@@ -60,15 +60,6 @@ def camera_from_mujoco(model, data, cam_name: str, width: int, height: int) -> C
     R_cv = np.diag([1.0, -1.0, -1.0]) @ R_wc.T          # world -> OpenCV camera
     t = -R_cv @ data.cam_xpos[cid]
     return CameraCalib(K, np.zeros(5), cv2.Rodrigues(R_cv)[0].reshape(3), t, width, height)
-
-
-def calibrate_extrinsics(K: np.ndarray, dist: np.ndarray, img_pts: np.ndarray, world_pts: np.ndarray,
-                         width: int, height: int) -> CameraCalib:
-    """Real rig: camera pose from >= 4 table points with known robot-frame coordinates (e.g. ArUco
-    marker centres measured by touching them with the gripper tip) and their pixel locations."""
-    ok, rvec, tvec = cv2.solvePnP(np.asarray(world_pts, np.float64), np.asarray(img_pts, np.float64), K, dist)
-    assert ok, "solvePnP failed"
-    return CameraCalib(K, np.asarray(dist, float), rvec.reshape(3), tvec.reshape(3), width, height)
 
 
 # ------------------------------------------------------------------------------- tracker

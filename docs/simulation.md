@@ -88,7 +88,7 @@ The tracker (`eaiproject/ball_tracker.py`) uses no learned detector:
 - **CV cost:** about 0.6–1 ms per 640×480 frame in Python, and about 2 ms when it has to search the whole table.
 - **Policy:** `TrackedInterceptPolicy` holds the home pose until the tracker has 4 measurements. It coasts on the filter when the gripper hides the ball, and holds still once the estimate reaches the line.
 - **Sim camera model:** `SimCamera` adds the frame rate, Gaussian pixel noise and a capture-to-tracker latency queue.
-- **Calibration:** in the sim it comes exactly from the MuJoCo camera (`camera_from_mujoco`). On the real rig, use a checkerboard for the intrinsics and `calibrate_extrinsics` (solvePnP) on 4+ table points with known robot-frame coordinates. Retune `hsv_lo`/`hsv_hi` on real frames, and pass `bgr=True` for OpenCV camera frames.
+- **Calibration:** in the sim it comes exactly from the MuJoCo camera (`camera_from_mujoco`). On the real rig the pose comes from the table markers and `config/rig_map.json` (`real_intercept.locate_camera`), with the RealSense factory intrinsics. Retune `hsv_lo`/`hsv_hi` on real frames, and pass `bgr=True` for OpenCV camera frames.
 
 ### Watching it live
 
