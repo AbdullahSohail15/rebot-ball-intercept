@@ -35,6 +35,13 @@ from scipy.optimize import least_squares
 
 from . import markers as _markers
 
+ROOT = Path(__file__).resolve().parents[1]
+MAP_PATH = ROOT / "config" / "rig_map.json"                 # committed: marker corners in the arm frame
+CAL_DIR = ROOT / "outputs" / "calibration"                  # camera_extrinsics.json, table_height.json
+SESSIONS_DIR = ROOT / "outputs" / "rig_calib"               # raw observations per capture session (git-ignored)
+GATE_X = 0.40                                               # intercept line of the "forward" mode
+BLOCK_TILT_DEG = 30.0                                       # gripper tilt of the blocking pose
+
 TABLE_PREFIX = "orig:"            # table markers; "4x4:" are the plate markers (not used)
 CORNER_NAMES = ("TL", "TR", "BR", "BL", "C")
 CENTRE = 4
@@ -77,6 +84,134 @@ def local_corners(size: float) -> np.ndarray:
     """(5, 2): TL, TR, BR, BL, centre in the marker's own frame (x right, y up)."""
     h = size / 2
     return np.array([[-h, h], [h, h], [h, -h], [-h, -h], [0.0, 0.0]])
+
+
+def _refine(gray: np.ndarray, corners, modules: int = 7, max_shift: float = 3.0, passes: int = 2) -> np.ndarray | None:
+    """Marker corners from straight lines fitted to the marker's four outer edges.
+
+    The detector's cornerSubPix pulls the corner of a blurred black square inwards (0.3-0.8 px in
+    our images), so markers look 1-3 % too small and a map built from them is stretched by several
+    mm at the far markers. Edge positions found across each side (gradient centroid) do not have
+    that bias; the corners are the intersections of the four fitted lines. `modules`: marker width
+    in cells incl. the black border (7 for DICT_ARUCO_ORIGINAL), which limits the search band so it
+    never reaches the first inner cell. Returns None if anything looks wrong.
+    """
+    c0 = np.asarray(corners, np.float64).reshape(4, 2)
+    c = c0
+    for _ in range(passes):
+        ctr, lines = c.mean(axis=0), []
+        for i in range(4):
+            a, b = c[i], c[(i + 1) % 4]
+            L = float(np.linalg.norm(b - a))
+            if L < 10:
+                return None
+            t = (b - a) / L
+            nrm = np.array([-t[1], t[0]])
+            if nrm @ (ctr - a) > 0:
+                nrm = -nrm                                             # pointing out of the marker
+            depth = 2 * abs(float(nrm @ (ctr - a)))                    # marker extent across this side (foreshortened)
+            half = float(np.clip(0.6 * depth / modules, 1.0, 4.0))
+            offs = np.arange(-half - 1, half + 1.01, 0.5)              # samples across the edge
+            base = a + np.linspace(0.15, 0.85, max(6, int(L * 0.7 / 1.5)))[:, None] * (b - a)
+            pts = (base[:, None, :] + offs[None, :, None] * nrm).astype(np.float32)
+            prof = cv2.remap(gray, pts[..., 0], pts[..., 1], cv2.INTER_LINEAR).astype(np.float64)
+            g = np.clip(np.diff(prof, axis=1), 0, None)                # black -> white going outwards
+            wsum = g.sum(axis=1)
+            ok = wsum > 0.25 * np.median(wsum)
+            if np.median(wsum) <= 0 or ok.sum() < 4:
+                return None
+            e = (g[ok] * (0.5 * (offs[:-1] + offs[1:]))).sum(axis=1) / wsum[ok]
+            vx, vy, x0, y0 = cv2.fitLine((base[ok] + e[:, None] * nrm).astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+            lines.append((np.array([x0, y0], float), np.array([vx, vy], float)))
+        out = np.empty((4, 2))
+        for i in range(4):
+            (p1, d1), (p2, d2) = lines[i - 1], lines[i]
+            A = np.column_stack([d1, -d2])
+            if abs(np.linalg.det(A)) < 1e-6:
+                return None
+            out[i] = p1 + np.linalg.solve(A, p2 - p1)[0] * d1
+        if not np.all(np.isfinite(out)) or np.abs(out - c0).max() > max_shift:
+            return None
+        c = out
+    return c
+
+
+def refine_corners(gray: np.ndarray, corners, **kw) -> np.ndarray:
+    """Edge-refined corners (see _refine); the input unchanged when the refinement fails."""
+    out = _refine(gray, corners, **kw)
+    return np.asarray(corners, np.float64).reshape(4, 2) if out is None else out
+
+
+def _edge_contrast(gray: np.ndarray, c: np.ndarray, modules: int = 7) -> float:
+    """Mean grey level just outside the quad minus just inside it: large and positive for a real
+    marker (white margin around a black border), small when something covers it."""
+    ctr, diff = c.mean(axis=0), []
+    for i in range(4):
+        a, b = c[i], c[(i + 1) % 4]
+        t = (b - a) / max(float(np.linalg.norm(b - a)), 1e-9)
+        nrm = np.array([-t[1], t[0]])
+        if nrm @ (ctr - a) > 0:
+            nrm = -nrm
+        d = max(1.0, abs(float(nrm @ (ctr - a))) / modules)          # half a border width
+        base = a + np.linspace(0.2, 0.8, 8)[:, None] * (b - a)
+        pts = np.stack([base + d * nrm, base - d * nrm]).astype(np.float32)
+        v = cv2.remap(gray, pts[..., 0], pts[..., 1], cv2.INTER_LINEAR).astype(float)
+        diff.append(v[0].mean() - v[1].mean())
+    return float(min(diff))
+
+
+def guided_corners(gray: np.ndarray, rig_map: "RigMap", K, dist, rvec, tvec, have=(), min_side_px: float = 10.0,
+                   max_shift: float = 3.0, min_contrast: float = 35.0) -> dict[str, np.ndarray]:
+    """Corners of map markers the detector did NOT report, found from a pose we already have.
+
+    The pose (from the markers that were detected, or from the last relocalisation) predicts where
+    every other marker's outline is; the edge fit then locks onto the real edges near that
+    prediction. This recovers small, far or blurred markers whose bit pattern the ArUco detector
+    cannot read. A marker is accepted only if all four edges are found within `max_shift` px of
+    the prediction with a clear white-outside / black-inside contrast (so a hand, the ball or the
+    arm over a marker gives nothing).
+    """
+    h, w = gray.shape[:2]
+    out = {}
+    for k, P in rig_map.markers.items():
+        if k in have:
+            continue
+        if np.any((cv2.Rodrigues(np.asarray(rvec, float))[0] @ P.T).T[:, 2] + np.asarray(tvec, float).reshape(3)[2] <= 0):
+            continue                                                   # behind the camera
+        pred = project(K, dist, rvec, tvec, P)
+        sides = np.linalg.norm(pred - np.roll(pred, -1, axis=0), axis=1)
+        if sides.min() < min_side_px or pred.min() < 6 or pred[:, 0].max() > w - 7 or pred[:, 1].max() > h - 7:
+            continue
+        c = _refine(gray, pred, max_shift=max_shift)
+        if c is not None and _edge_contrast(gray, c) >= min_contrast:
+            out[k] = c
+    return out
+
+
+def detect_table(img_bgr: np.ndarray, sizes: dict | None = None) -> dict[str, np.ndarray]:
+    """Table markers in an image with edge-refined corners: key -> (4, 2). Use this (not the raw
+    markers.detect) for everything that builds or uses the rig map, so both see the same corners."""
+    found = table_only(_markers.detect(img_bgr), sizes)
+    if not found:
+        return found
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    return {k: refine_corners(gray, c) for k, c in found.items()}
+
+
+def detect_with_map(img_bgr: np.ndarray, rig_map: "RigMap", K, dist, pose=None) -> tuple[dict, list]:
+    """detect_table() plus guided_corners() for the map markers it missed. `pose` = (rvec, tvec) to
+    predict from; None = a PnP on the markers detected in this image (needs 2 of them).
+    Returns (key -> corners, keys that were found by prediction)."""
+    found = {k: c for k, c in detect_table(img_bgr, rig_map.sizes).items() if k in rig_map.markers}
+    if pose is None:
+        if len(found) < 2:
+            return found, []
+        try:
+            pose = _pnp(np.concatenate([rig_map.markers[k] for k in found]), np.concatenate(list(found.values())), K, dist)
+        except (CalibrationError, cv2.error):
+            return found, []
+    extra = guided_corners(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), rig_map, K, dist, *pose, have=found)
+    return {**found, **extra}, sorted(extra)
 
 
 def average_corners(frames: list[dict], min_frac: float = 0.7) -> tuple[dict, dict]:
@@ -595,6 +730,17 @@ def solve_rig(obs: Observations, far_dist: float = FAR_DIST, leave_one_out: bool
         "plane_tilt_deg_x_y": [round(float(np.degrees(np.arctan(plane[1]))), 3), round(float(np.degrees(np.arctan(plane[2]))), 3)],
         "far_markers": [k for i, k in enumerate(keys) if np.linalg.norm(P[i, 4, :2]) >= far_dist],
     }
+    # Scale check: the camera sees distances in units of the marker size, the arm measures them
+    # directly. If the touched points are spread differently from the fitted corners, the printed
+    # marker size (or the corner detection) is off.
+    fit_xy, t_xy = (prob.t_p - touch)[:, :2], prob.t_p[:, :2]
+    fc, tc = fit_xy - fit_xy.mean(axis=0), t_xy - t_xy.mean(axis=0)
+    scale = float(np.sum(fc * tc) / max(np.sum(fc * fc), 1e-12))
+    report["touch_scale_percent"] = round((scale - 1) * 100, 3)
+    if abs(scale - 1) > max(0.004, 3 * geo["sigma_mm_per_m"] / 1000) and geo["span_m"] >= MIN_TOUCH_SPAN:
+        warn.append(f"the touched points are {abs(scale - 1) * 100:.1f} % {'further apart' if scale > 1 else 'closer together'} "
+                    "than the camera's layout: measure a printed marker side (must match markers.py) and check the "
+                    "camera intrinsics / resolution")
     if report["reproj_rms_px"] > OK_PX:
         warn.append(f"reprojection RMS {report['reproj_rms_px']} px is above {OK_PX} px")
     if report["touch_rms_mm"] > OK_MM:
@@ -635,7 +781,7 @@ def solve_rig(obs: Observations, far_dist: float = FAR_DIST, leave_one_out: bool
                      time=time.strftime("%Y-%m-%d %H:%M:%S"),
                      stats={k: report[k] for k in ("n_views", "n_markers", "n_touches", "n_sweep_points", "reproj_rms_px",
                                                    "per_marker_reproj_px", "touch_rms_mm", "touch_xy_rms_mm",
-                                                   "touch_dz_mean_mm", "sweep_rms_mm", "touch_geometry")}
+                                                   "touch_dz_mean_mm", "touch_scale_percent", "sweep_rms_mm", "touch_geometry")}
                      | ({"leave_one_marker_out": report["leave_one_marker_out"]} if leave_one_out else {}),
                      warnings=list(warn), sources=dict(obs.sources))
     report["warnings"] = warn
@@ -676,6 +822,7 @@ class Reloc:
     reproj_rms_px: float
     table_rms_mm: float
     camera_position: np.ndarray
+    guided: list = field(default_factory=list)      # markers located by prediction (guided_corners)
 
     @property
     def status(self) -> str:
@@ -704,17 +851,21 @@ def marker_errors(rig_map: RigMap, K, dist, rvec, tvec, detections: dict) -> tup
     return px, mm
 
 
-def relocalize(rig_map: RigMap, K, dist, detections: dict, min_markers: int = 3, require_far: bool = True) -> Reloc:
+def relocalize(rig_map: RigMap, K, dist, detections: dict, min_markers: int = 3, require_far: bool = True,
+               guided: dict | None = None) -> Reloc:
     """Camera pose in the arm frame from ONE PnP over all visible table-marker corners.
 
     `detections`: key -> (4, 2) corners, ideally averaged over ~30 frames (average corners, not
     poses). Refuses (CalibrationError) with fewer than `min_markers` map markers, or when none of
     them is far from the arm: near markers alone leave the pose loose across the table.
+    `guided`: extra corners from guided_corners() (markers located by prediction, not identified by
+    their bit pattern). They join the fit but do not count towards the two rules above.
     """
     seen = {k: np.asarray(c, float).reshape(4, 2) for k, c in detections.items() if k in rig_map.markers}
+    extra = {k: np.asarray(c, float).reshape(4, 2) for k, c in (guided or {}).items() if k in rig_map.markers and k not in seen}
     unknown = sorted(k for k in detections if is_table(k) and k not in rig_map.markers)
 
-    def check(keys):
+    def check_ids(keys):
         if len(keys) < min_markers:
             raise CalibrationError(
                 f"only {len(keys)} map marker(s) visible ({sorted(keys)}); need at least {min_markers} of "
@@ -731,10 +882,13 @@ def relocalize(rig_map: RigMap, K, dist, detections: dict, min_markers: int = 3,
         return rv, tv, marker_errors(rig_map, K, dist, rv, tv, {k: seen[k] for k in keys})
 
     keys = sorted(seen)
-    check(keys)
+    check_ids(keys)
+    check = lambda keys: check_ids([k for k in keys if k not in extra])          # rules apply to identified markers
+    seen.update(extra)
+    keys = sorted(seen)
     rvec, tvec, (px, mm) = fit(keys)
     rejected = []
-    if len(keys) > min_markers and np.mean(list(px.values())) > OK_PX:
+    if len([k for k in keys if k not in extra]) > min_markers and np.mean(list(px.values())) > OK_PX:
         # A bad fit with markers to spare: does dropping ONE marker (moved on the table, misread) fix it?
         best = None
         for k in keys:
@@ -758,7 +912,7 @@ def relocalize(rig_map: RigMap, K, dist, detections: dict, min_markers: int = 3,
     e_mm = np.linalg.norm(backproject_to_plane(K, dist, rvec, tvec, rig_map.plane, allc)
                           - np.concatenate([rig_map.markers[k] for k in keys]), axis=1) * 1000
     return Reloc(rvec, tvec, keys, rejected, px, mm, float(np.sqrt(np.mean(e_px ** 2))),
-                 float(np.sqrt(np.mean(e_mm ** 2))), C)
+                 float(np.sqrt(np.mean(e_mm ** 2))), C, sorted(k for k in keys if k in extra))
 
 
 def extrinsics_dict(res: Reloc, rig_map: RigMap, K, dist, width: int, height: int, table_ref_xy=(0.56, 0.01),
@@ -773,7 +927,7 @@ def extrinsics_dict(res: Reloc, rig_map: RigMap, K, dist, width: int, height: in
             "camera_position_robot_frame": res.camera_position.tolist(),
             "table_z": float(plane_z(rig_map.plane, *table_ref_xy)),
             "plane_z=a+bx+cy": [float(v) for v in rig_map.plane],
-            "markers_used": res.used, "markers_rejected": res.rejected,
+            "markers_used": res.used, "markers_guided": res.guided, "markers_rejected": res.rejected,
             "reproj_rms_px": round(res.reproj_rms_px, 3), "table_rms_mm": round(res.table_rms_mm, 2),
             "per_marker_reproj_px": {k: round(v, 3) for k, v in res.per_marker_px.items()},
             "status": res.status,
@@ -793,10 +947,14 @@ class PoseMonitor:
     def due(self, now: float) -> bool:
         return self.t_last is None or now - self.t_last >= self.period
 
+    def detect(self, img_bgr: np.ndarray) -> dict:
+        """Markers for update(): detected ones plus those found where the pose predicts them."""
+        return detect_with_map(img_bgr, self.map, self.K, self.dist, (self.rvec, self.tvec))[0]
+
     def update(self, detections: dict, now: float) -> str | None:
-        """Returns a warning text, or None while the pose still agrees with the map."""
+        """`detections` from self.detect(img). Returns a warning text, or None while the pose still agrees with the map."""
         self.t_last = now
-        px, _ = marker_errors(self.map, self.K, self.dist, self.rvec, self.tvec, table_only(detections, self.map.sizes))
+        px, _ = marker_errors(self.map, self.K, self.dist, self.rvec, self.tvec, detections)
         self.n_markers = len(px)
         if len(px) < 2:
             self.median_px = None
@@ -811,3 +969,17 @@ class PoseMonitor:
             return (f"CAMERA MOVED? markers are {self.median_px:.1f} px off the map (limit {self.warn_px} px): "
                     "run scripts/real/relocalize.py")
         return None
+
+
+def latest_session() -> Path | None:
+    ds = [d for d in SESSIONS_DIR.glob("*") if d.is_dir() and any((d / f).exists() for f in ("views.json", "touches.json"))]
+    return max(ds, key=lambda d: d.stat().st_mtime) if ds else None
+
+
+def write_json_with_backup(path, data: dict) -> None:
+    """Write JSON; an existing file is kept next to it as <name>.prev.json."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.replace(path.with_suffix(".prev.json"))
+    path.write_text(json.dumps(data, indent=2) + "\n")
