@@ -5,13 +5,15 @@ the predicted crossing point, and where the gripper WOULD go (fingertip target).
 the MuJoCo arm in the pose the planner would command. Each roll is scored: the predicted crossing
 point at 0.5 / 0.3 / 0.15 s before the ball reaches the line vs where it actually crossed.
 
-    scripts/real/start_camera.sh                        # camera server at the calibration resolution
+    scripts/real/start_camera.sh
     .venv/bin/python scripts/real/real_tracking.py
 
-If config/rig_map.json exists, the camera pose is re-checked against the table markers every few
-seconds (in a background thread); a red warning means the camera was moved: run relocalize.py.
+The camera pose is found at start from the table markers and config/rig_map.json (hands and arm away
+from the markers for the first second). It is re-checked every few seconds in the background; a red
+warning means the camera was moved: press c.
 
-Keys: a  auto-tune the ball colour (ball resting alone on the table)
+Keys: c  locate the camera again (after it was moved)
+      a  auto-tune the ball colour (ball resting alone on the table)
       w  save the colour thresholds        h  show/hide the colour-mask inset
       r  reset the tracker                 q  quit (prints the roll statistics)
 The HSV window has sliders for manual tuning.
@@ -30,8 +32,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from eaiproject.real_intercept import (HostClock, InterceptPlanner, auto_hsv, load_calibration,  # noqa: E402
-                                       load_hsv, make_tracker, save_hsv, table_z)
+from eaiproject.real_intercept import (HostClock, InterceptPlanner, auto_hsv, camera_calib, load_hsv,  # noqa: E402
+                                       locate_camera, make_tracker, save_hsv, table_z)
 from eaiproject import rig_calib  # noqa: E402
 from eaiproject.realsense_client import RealSenseClient  # noqa: E402
 
@@ -53,24 +55,39 @@ class Roll:
         self.speed = None
 
 
+def setup(cam, rig_map):
+    """Locate the camera on the marker map; returns (calibration, tracker, pose monitor)."""
+    res = locate_camera(cam, rig_map)
+    print(f"camera located: {res.status}, {res.reproj_rms_px:.2f} px / {res.table_rms_mm:.1f} mm on {len(res.used)} markers "
+          f"{res.used}; position x {res.camera_position[0]:.2f} y {res.camera_position[1]:.2f} z {res.camera_position[2]:.2f} m",
+          flush=True)
+    if res.rejected:
+        print(f"WARNING: marker {res.rejected} does not fit the map (moved on the table?)", flush=True)
+    calib = camera_calib(cam, res)
+    return calib, make_tracker(calib, rig_map.plane), rig_calib.PoseMonitor(rig_map, calib.K, calib.dist, calib.rvec, calib.tvec)
+
+
 def main() -> int:
-    calib, plane, cal = load_calibration()
+    if not rig_calib.MAP_PATH.exists():
+        print("config/rig_map.json not found: run scripts/real/calibrate.py first (docs/calibration_protocol.md)")
+        return 2
+    rig_map = rig_calib.RigMap.load(rig_calib.MAP_PATH)
+    plane = rig_map.plane
     try:
         cam = RealSenseClient()
     except OSError:
         print("Camera server not running: scripts/real/start_camera.sh")
         return 2
-    if (cam.width, cam.height) != (calib.width, calib.height):
-        print(f"camera {cam.width}x{cam.height} != calibration {calib.width}x{calib.height}: restart the server")
-        return 2
-    trk, zt = make_tracker(calib, plane)
+    try:
+        calib, trk, monitor = setup(cam, rig_map)
+    except rig_calib.CalibrationError as e:
+        print(f"CANNOT LOCATE THE CAMERA: {e}")
+        cam.close()
+        return 1
     planner = InterceptPlanner(plane)
     gx = planner.gate_x
     clock = HostClock()
-    # camera-pose watchdog: reproject the marker map with the loaded pose and compare with what is seen
-    monitor, mon_thread, mon_warned = None, None, False
-    if rig_calib.MAP_PATH.exists():
-        monitor = rig_calib.PoseMonitor(rig_calib.RigMap.load(rig_calib.MAP_PATH), calib.K, calib.dist, calib.rvec, calib.tvec)
+    mon_thread, mon_warned = None, False
 
     # MuJoCo shadow render
     m, d = planner.env.model, mujoco.MjData(planner.env.model)
@@ -93,8 +110,7 @@ def main() -> int:
     def proj(P):
         return calib.project(np.atleast_2d(P)).round().astype(int)
 
-    # intercept line and table outline (on the table plane)
-    line_pts = proj([[gx, y, table_z(plane, gx, y)] for y in (-0.30, 0.30)])
+    ball_z = lambda x, y: table_z(plane, x, y) + 0.022          # height of the ball centre
     show_mask, last_fn, rolls, roll = True, None, [], None
     frame_i, sim = 0, None
     fps, t_prev = 0.0, time.monotonic()
@@ -112,11 +128,11 @@ def main() -> int:
         trk.lo, trk.hi = np.array(l, np.uint8), np.array(h, np.uint8)
 
         det = trk.process(f.img, t_cap)
-        if monitor is not None and monitor.due(now) and (mon_thread is None or not mon_thread.is_alive()):
+        if monitor.due(now) and (mon_thread is None or not mon_thread.is_alive()):
             monitor.t_last = now
             mon_thread = threading.Thread(target=lambda im=f.img, t=now: monitor.update(monitor.detect(im), t), daemon=True)
             mon_thread.start()
-        if monitor is not None and bool(monitor.warning) != mon_warned:
+        if bool(monitor.warning) != mon_warned:
             mon_warned = bool(monitor.warning)
             print(monitor.warning or "camera pose agrees with the map again", flush=True)
         if trk.x is not None and now - (trk.t_last_meas or now) > 0.6:
@@ -155,15 +171,16 @@ def main() -> int:
 
         # ---- drawing
         img = f.img.copy()
+        line_pts = proj([[gx, y, table_z(plane, gx, y)] for y in (-0.30, 0.30)])
         cv2.line(img, tuple(line_pts[0]), tuple(line_pts[1]), (255, 255, 255), 1)
         if det is not None:
             cv2.circle(img, tuple(np.round(det.uv).astype(int)), int(max(det.radius_px, 4)) + 3, (0, 255, 0), 2)
         if len(trk.history) > 1:
-            pts = proj([[xy[0], xy[1], zt + 0.022] for _, xy in trk.history[-60:]])
+            pts = proj([[xy[0], xy[1], ball_z(*xy)] for _, xy in trk.history[-60:]])
             cv2.polylines(img, [pts], False, (0, 200, 255), 1)
         if st is not None:
-            c = proj([[*st.pos, zt + 0.022]])[0]
-            tipv = proj([[*(st.pos + st.vel * 0.25), zt + 0.022]])[0]
+            c = proj([[*st.pos, ball_z(*st.pos)]])[0]
+            tipv = proj([[*(st.pos + st.vel * 0.25), ball_z(*st.pos)]])[0]
             cv2.arrowedLine(img, tuple(c), tuple(tipv), (255, 0, 255), 2)
             if p.crossing_y is not None:
                 cp = proj([[gx, p.crossing_y, table_z(plane, gx, p.crossing_y) + 0.022]])[0]
@@ -185,11 +202,10 @@ def main() -> int:
                 (8, 58), (255, 0, 255))
         put(img, f"SHADOW: arm not powered | jaw target z {(p.jaw[2]-table_z(plane, gx, p.jaw[1]))*1000:.0f} mm above table"
                  f" | IK err {p.ik_err*1000:.1f} mm", (8, img.shape[0] - 10), (0, 255, 255), 0.45)
-        if monitor is not None:
-            if monitor.warning:
-                put(img, monitor.warning, (8, 82), (0, 0, 255), 0.5, 2)
-            elif monitor.median_px is not None:
-                put(img, f"camera pose check: {monitor.median_px:.1f} px on {monitor.n_markers} markers", (8, 78), (160, 160, 160), 0.4)
+        if monitor.warning:
+            put(img, monitor.warning, (8, 82), (0, 0, 255), 0.5, 2)
+        elif monitor.median_px is not None:
+            put(img, f"camera pose check: {monitor.median_px:.1f} px on {monitor.n_markers} markers", (8, 78), (160, 160, 160), 0.4)
         if msg and now - msg_t < 6:
             put(img, msg, (8, img.shape[0] - 30), (255, 255, 0), 0.45)
         if show_mask and trk.last_mask is not None:
@@ -229,6 +245,16 @@ def main() -> int:
         if k == ord("w"):
             save_hsv(l, h)
             msg, msg_t = f"saved HSV lo {l} hi {h}", now
+        if k == ord("c"):
+            try:
+                hsv_now = (trk.lo, trk.hi)
+                calib, trk, monitor = setup(cam, rig_map)
+                trk.lo, trk.hi = hsv_now
+                planner.reset(); roll = None
+                msg, msg_t = "camera located again", now
+            except rig_calib.CalibrationError as e:
+                msg, msg_t = f"cannot locate the camera: {e}"[:110], now
+                print(msg, flush=True)
         if k == ord("h"):
             show_mask = not show_mask
         if k == ord("r"):

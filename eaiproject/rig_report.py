@@ -1,35 +1,17 @@
-"""Offline solve of the static rig calibration from saved observations (no hardware).
-
-Reads outputs/rig_calib/<session>/ (views.json, touches.json, sweep.npz from rig_capture.py), fits
-the table plane, every table marker and one camera pose per view in the arm's kinematic frame, and
-writes:
-
-    config/rig_map.json                       marker corners in the arm frame (commit this file)
-    outputs/calibration/table_height.json     table plane from the sweep, in the format the planner reads
-    outputs/rig_calib/<session>/report/       report.json, report.txt, layout.png, sweep_heatmap.png,
-                                              reproj_<view>.png (the fitted markers over each view)
-
-    .venv/bin/python scripts/real/rig_solve.py                   # newest session
-    .venv/bin/python scripts/real/rig_solve.py --session 20261126 --dry-run
-"""
+"""The report of a rig calibration solve: text, top-view layout, sweep heat map, reprojection overlays."""
 from __future__ import annotations
 
-import argparse
 import json
-import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-from eaiproject import rig_calib as rc  # noqa: E402
-from eaiproject.rig_draw import (GREEN, GREY, MAGENTA, WHITE, YELLOW, TopDown, colorbar, diverging, ipt,  # noqa: E402
-                                 outline, put)
+from . import rig_calib as rc
+from .rig_draw import GREEN, GREY, MAGENTA, WHITE, YELLOW, TopDown, colorbar, diverging, ipt, outline, put
 
 
-def report_text(sol: rc.RigSolution, sweep_stats: dict, th: dict | None) -> str:
+def report_text(sol: rc.RigSolution, sweep_stats: dict | None = None) -> str:
     r = sol.report
     g = r["touch_geometry"]
     L = [f"=== rig calibration ({sol.rig_map.time}) ===",
@@ -59,14 +41,13 @@ def report_text(sol: rc.RigSolution, sweep_stats: dict, th: dict | None) -> str:
           f"table plane: z = {r['plane_z=a+bx+cy'][0] * 1000:.1f} mm at the base, tilt {r['plane_tilt_deg_x_y'][0]:+.2f} deg "
           f"along x, {r['plane_tilt_deg_x_y'][1]:+.2f} deg along y",
           f"sweep: RMS {r['sweep_rms_mm']} mm, max {r['sweep_max_mm']} mm   {sweep_stats or ''}",
-          f"far markers (needed for relocalisation): {r['far_markers']}"]
-    if th is not None:
-        c = th["curvature"]
-        L += [f"table height along the intercept line (mm): {th['z_at_gate_mm']}",
-              f"curvature: plane RMS {c['rms_plane_mm']:.2f} mm, quadratic RMS "
-              f"{c['rms_quadratic_mm'] if c['rms_quadratic_mm'] is None else round(c['rms_quadratic_mm'], 2)} mm, bend "
-              f"{c['bend_mm']:.1f} mm -> " + ("SMOOTH CURVATURE: quadratic saved as an extra field (planner still uses the plane)"
-                                             if c["significant"] else "plane is enough")]
+          f"far markers (one must be in view to locate the camera): {r['far_markers']}"]
+    if "surface" in r:
+        c = r["surface"]
+        L += [f"table height on the intercept line (mm): "
+              + "  ".join(f"y{y:+.2f}: {float(rc.plane_z(sol.rig_map.plane, rc.GATE_X, y)) * 1000:.1f}" for y in (-0.24, 0.0, 0.24)),
+              f"surface: plane RMS {c['rms_plane_mm']:.2f} mm, quadratic RMS {c['rms_quadratic_mm']:.2f} mm, bend "
+              f"{c['bend_mm']:.1f} mm -> " + ("CURVED (see warnings)" if c["significant"] else "a plane is enough")]
     L += ["", "WARNINGS:" if sol.warnings else "no warnings"] + [f"  - {w}" for w in sol.warnings]
     ok = not sol.warnings and r["reproj_rms_px"] < rc.OK_PX and r["touch_rms_mm"] < rc.OK_MM
     L += ["", f"RESULT: {'OK' if ok else 'CHECK THE WARNINGS'}"]
@@ -132,64 +113,15 @@ def reproj_images(sol: rc.RigSolution, obs: rc.Observations, sess: Path, out: Pa
     return n
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--session", help="folder under outputs/rig_calib/ (default: the newest one)")
-    ap.add_argument("--ref-tilt", default=str(rc.BLOCK_TILT_DEG),
-                    help="sweep reference tilt in deg, or 'median' to use the sweep's own median tilt")
-    ap.add_argument("--max-dev", type=float, default=5.0, help="sweep: allowed orientation deviation, deg")
-    ap.add_argument("--far-dist", type=float, default=rc.FAR_DIST,
-                    help="markers farther than this from the base count as 'far' for relocalisation (m)")
-    ap.add_argument("--dry-run", action="store_true", help="report only; do not write the map or table_height.json")
-    args = ap.parse_args()
-    sess = rc.SESSIONS_DIR / args.session if args.session else rc.latest_session()
-    if sess is None or not sess.exists():
-        print(f"no capture session found under {rc.SESSIONS_DIR}; run scripts/real/rig_capture.py first")
-        return 2
-    ref = None if args.ref_tilt == "median" else float(args.ref_tilt)
-    obs, sweep_stats = rc.load_observations(sess, ref, args.max_dev)
-    rel = lambda p: str(p.relative_to(ROOT)) if p.is_relative_to(ROOT) else str(p)
-    obs.sources["session"] = rel(sess)
-    print(f"session {sess}: {len(obs.views)} views, {len(obs.touches)} touches, sweep {sweep_stats or 'none'}")
-    if sweep_stats and sweep_stats["n_raw"] and sweep_stats["n_tilt_rejected"] > 0.5 * sweep_stats["n_raw"]:
-        print(f"NOTE: {sweep_stats['n_tilt_rejected']} of {sweep_stats['n_raw']} sweep samples are more than "
-              f"{args.max_dev:.0f} deg from the {sweep_stats['ref_tilt_deg']:.0f} deg tilt (try --ref-tilt median to see "
-              "what tilt was actually held)")
-    try:
-        sol = rc.solve_rig(obs, far_dist=args.far_dist)
-    except rc.CalibrationError as e:
-        print(f"\nCANNOT SOLVE: {e}")
-        return 1
-    th = None
-    if len(obs.sweep) >= 10 or len(sol.touch_points) >= 3:
-        th = rc.table_height_dict(obs.sweep, rc.GATE_X, sol.touch_points)
-        th["rig_map_time"] = sol.rig_map.time
-        d = [abs(float(rc.plane_z(th["plane_z=a+bx+cy"], rc.GATE_X, y) - rc.plane_z(sol.rig_map.plane, rc.GATE_X, y)))
-             for y in (-0.24, 0.0, 0.24)]
-        th["max_diff_to_map_plane_at_gate_mm"] = round(max(d) * 1000, 2)
-    text = report_text(sol, sweep_stats, th)
-    print("\n" + text)
-
-    out = sess / "report"
+def save_report(sol: rc.RigSolution, obs: rc.Observations, sweep_stats: dict, sess: Path) -> tuple[Path, str]:
+    """Write report.txt / report.json / layout.png / sweep_heatmap.png / reproj_<view>.png to <sess>/report."""
+    out = Path(sess) / "report"
     out.mkdir(exist_ok=True)
+    text = report_text(sol, sweep_stats)
     (out / "report.txt").write_text(text + "\n")
-    (out / "report.json").write_text(json.dumps({**sol.report, "sweep_filter": sweep_stats, "table_height": th}, indent=2))
+    (out / "report.json").write_text(json.dumps({**sol.report, "sweep_filter": sweep_stats}, indent=2))
     cv2.imwrite(str(out / "layout.png"), layout_image(sol, obs))
     if len(obs.sweep):
         cv2.imwrite(str(out / "sweep_heatmap.png"), heatmap_image(sol, obs))
-    n = reproj_images(sol, obs, sess, out)
-    print(f"\nreport: {out} (report.txt, report.json, layout.png, sweep_heatmap.png, {n} reprojection overlays)")
-    if args.dry_run:
-        print("dry run: map and table height NOT written")
-        return 0
-    sol.rig_map.save(rc.MAP_PATH)
-    print(f"wrote {rel(rc.MAP_PATH)}  (commit it)")
-    if th is not None:
-        rc.write_json_with_backup(rc.CAL_DIR / "table_height.json", th)
-        print(f"wrote {rel(rc.CAL_DIR / 'table_height.json')}")
-    print("next: scripts/real/relocalize.py (camera at the tracking resolution), then scripts/real/check_calibration.py")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    reproj_images(sol, obs, Path(sess), out)
+    return out, text

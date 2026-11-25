@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 import sim_rig  # noqa: E402
-from eaiproject import real_intercept  # noqa: E402
+from eaiproject import markers, real_intercept  # noqa: E402
 from eaiproject import rig_calib as rc  # noqa: E402
 
 BIAS = np.array([0.002, -0.001, 0.009])
@@ -82,117 +82,106 @@ class ScriptsOnSimulatedRig(unittest.TestCase):
 
     def test_full_pipeline(self):
         tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        cal = tmp / "calibration"
+        out_dir = tmp / "calibration"
         for target, value in ((rc, {"SESSIONS_DIR": tmp / "rig_calib", "MAP_PATH": tmp / "config" / "rig_map.json",
-                                    "CAL_DIR": cal}), (real_intercept, {"CAL_DIR": cal})):
+                                    "OUT_DIR": out_dir}), (real_intercept, {"CAL_DIR": out_dir})):
             self.enterContext(mock.patch.multiple(target, **value))
         world = sim_rig.World()
         self.cam, self.arm = sim_rig.FakeCamera(world), sim_rig.FakeArm(world, BIAS)
         kin = {k: P[:4] + BIAS for k, P in world.truth.items()}            # what the map should contain
         idle = [(None, None)] * 2
+        enter = [("\r", None)]
 
-        # 1. views: six camera positions
+        # ---- calibrate.py, one run: views -> touch -> sweep -> solve
         steps = []
-        for eye in VIEW_EYES:
+        for eye in VIEW_EYES:                                               # 1. six camera positions
             steps += [(None, lambda e=eye: self.cam.set_pose(e)), (None, None), (" ", None)]
-        code, out = self.run_script("rig_capture", ["views", "--session", "sim"], steps + idle)
-        self.assertEqual(code, 0, out)
-        self.assertEqual(len(json.loads((tmp / "rig_calib/sim/views.json").read_text())["views"]), 6)
-
-        # 2. touches: all corners of the two markers within reach (107 first, then n x3 past the far ones to 880)
-        self.cam.set_pose(VIEW_EYES[0])
-        steps = list(idle)
-        for key, skip in (("orig:107", 0), ("orig:880", 3)):
+        steps += enter + idle
+        # 2. all corners of the two markers within reach: 107, then n x3 past the far ones to 880
+        for key, skip in (("107", 0), ("880", 3)):
             steps += [("n", None)] * skip
             for c in range(4):
                 steps += [(None, lambda k=key, c=c: self.arm.touch(world.truth[k][c])), (" ", None)]
-        steps += [("c", lambda: self.arm.touch(world.truth["orig:880"][4]))]
-        code, out = self.run_script("rig_capture", ["touch", "--session", "sim"], steps + idle)
-        self.assertEqual(code, 0, out)
-        touches = json.loads((tmp / "rig_calib/sim/touches.json").read_text())["touches"]
-        self.assertEqual([(t["key"], t["corner"]) for t in touches],
-                         [("orig:107", c) for c in range(4)] + [("orig:880", c) for c in range(5)])
-        self.assertNotIn("CHECK", out)
-
-        # 3. sweep: hold SPACE while the fingertip rasters over the table; then a stroke at the wrong tilt
+        steps += [("c", lambda: self.arm.touch(world.truth["880"][4]))] + enter
+        # 3. hold SPACE while the fingertip rasters over the table; then a stroke at the wrong tilt
         t0 = time.monotonic()
-        self.arm.path = lambda t: (0.28 + 0.26 * (((t - t0) * 0.9) % 1.0), 0.27 * np.sin((t - t0) * 40.0))
+
+        def start_sweep():
+            self.arm.path = lambda t: (0.28 + 0.26 * (((t - t0) * 0.9) % 1.0), 0.27 * np.sin((t - t0) * 40.0))
+
         hold = [(" ", lambda: time.sleep(0.02))] * 60
         release = [(None, lambda: time.sleep(0.4))] * 4
-        tilt_wrong = [(None, lambda: setattr(self.arm, "tilt", 50.0))]
-        code, out = self.run_script("rig_capture", ["sweep", "--session", "sim"], idle + hold + release + tilt_wrong + hold[:10] + release)
+        steps += [(None, start_sweep)] + idle + hold + release
+        steps += [(None, lambda: setattr(self.arm, "tilt", 50.0))] + hold[:10] + release + enter
+        steps += idle + enter                                               # the result screen, then done
+        code, out = self.run_script("calibrate", ["--session", "sim"], steps)
         self.arm.path, self.arm.tilt = None, 30.0
         self.assertEqual(code, 0, out)
-        z = np.load(tmp / "rig_calib/sim/sweep.npz")
-        self.assertGreater(len(z["p"]), 500)
-
-        # 4. offline solve
-        code, out = self.run_script("rig_solve", ["--session", "sim"])
-        self.assertEqual(code, 0, out)
+        sess = tmp / "rig_calib/sim"
+        self.assertEqual(len(json.loads((sess / "views.json").read_text())["views"]), 6)
+        touches = json.loads((sess / "touches.json").read_text())["touches"]
+        self.assertEqual([(t["key"], t["corner"]) for t in touches],
+                         [("107", c) for c in range(4)] + [("880", c) for c in range(5)])
+        self.assertNotIn("CHECK", out)
+        self.assertGreater(len(np.load(sess / "sweep.npz")["p"]), 500)
         self.assertIn("no warnings", out)
         rig_map = rc.RigMap.load(rc.MAP_PATH)
         err = np.concatenate([np.linalg.norm(rig_map.markers[k] - kin[k], axis=1) for k in kin]) * 1000
-        self.assertLess(err.max(), 3.0, f"map corner errors (mm): {err.round(2)}")
-        th = json.loads((cal / "table_height.json").read_text())
-        self.assertAlmostEqual(th["plane_z=a+bx+cy"][0], world.plane[0] + BIAS[2], delta=0.001)
-        self.assertGreater(json.loads((tmp / "rig_calib/sim/report/report.json").read_text())["sweep_filter"]["n_tilt_rejected"], 50)
+        self.assertLess(err.max(), 2.0, f"map corner errors (mm): {err.round(2)}")
+        self.assertAlmostEqual(rig_map.plane[0], world.plane[0] + BIAS[2], delta=0.001)
+        self.assertGreater(json.loads((sess / "report/report.json").read_text())["sweep_filter"]["n_tilt_rejected"], 50)
         for f in ("report.txt", "layout.png", "sweep_heatmap.png", "reproj_view_00.png"):
-            self.assertTrue((tmp / "rig_calib/sim/report" / f).exists(), f)
+            self.assertTrue((sess / "report" / f).exists(), f)
 
-        # 5. relocalise: NEW camera position, tracking resolution
+        # ---- the offline re-solve gives the same map
+        code, out = self.run_script("calibrate", ["--solve"])
+        self.assertEqual(code, 0, out)
+        again = rc.RigMap.load(rc.MAP_PATH)
+        for k in kin:
+            np.testing.assert_allclose(again.markers[k], rig_map.markers[k], atol=1e-5)
+
+        # ---- check_calibration.py from a NEW camera position at the tracking resolution: it locates the
+        # camera itself; fingertip on a corner, then the ball on a marker centre and on a touched point
         cam2 = sim_rig.FakeCamera(world, 640, 480)
         cam2.set_pose((1.55, 0.30, 0.95), (0.55, 0.0, 0.0))
-        code, out = self.run_script("relocalize", [], cam=cam2)
-        self.assertEqual(code, 0, out)
-        ext = json.loads((cal / "camera_extrinsics.json").read_text())
-        self.assertEqual((ext["width"], ext["height"]), (640, 480))
-        eye_kin = np.array([1.55, 0.30, 0.95]) + BIAS
-        self.assertLess(np.linalg.norm(np.array(ext["camera_position_robot_frame"]) - eye_kin) * 1000, 8.0)
-        calib, plane, _ = real_intercept.load_calibration()              # the planner's loader reads both files
-        self.assertEqual(calib.width, 640)
-        self.assertEqual(len(plane), 3)
-
-        # 5b. too few markers in view: refuse and keep the old file
-        cam3 = sim_rig.FakeCamera(world, 640, 480)
-        cam3.set_pose((0.9, 0.0, 0.5), (0.30, 0.0, 0.0))
-        code, out = self.run_script("relocalize", [], cam=cam3)
-        self.assertEqual(code, 1, out)
-        self.assertIn("REFUSED", out)
-        self.assertEqual(json.loads((cal / "camera_extrinsics.json").read_text())["time"], ext["time"])
-
-        # 6. live check: fingertip on a corner, then the ball on a marker centre and on a touched point
-        centre = world.truth["orig:467"][4]
-        steps = idle + [(None, lambda: self.arm.touch(world.truth["orig:107"][1])), (None, None), (" ", None),
+        centre = world.truth["467"][4]
+        steps = idle + [(None, lambda: self.arm.touch(world.truth["107"][1])), (None, None), (" ", None),
                         (None, lambda: self.arm.touch(world.on_table([(0.45, 0.05)])[0])), ("t", None),
                         ("b", lambda: setattr(world, "ball", tuple(centre[:2]))), (None, None), (" ", None),
-                        (None, lambda: setattr(world, "ball", (0.45, 0.05))), (None, None), (" ", None), ("s", None)]
+                        (None, lambda: setattr(world, "ball", (0.45, 0.05))), (None, None), (" ", None), ("s", None),
+                        ("c", lambda: cam2.set_pose((1.50, -0.30, 0.90))), (None, None), (None, None), (" ", None)]
         code, out = self.run_script("check_calibration", ["--label", "sim1"], steps + idle, cam=cam2)
         self.assertEqual(code, 0, out)
-        with (cal / "validation.csv").open() as fh:
+        pose = json.loads((out_dir / "camera_pose.json").read_text())
+        self.assertEqual((pose["width"], pose["height"]), (640, 480))
+        self.assertLess(np.linalg.norm(np.array(pose["camera_position"]) - (np.array([1.50, -0.30, 0.90]) + BIAS)) * 1000, 8.0)
+        with (out_dir / "validation.csv").open() as fh:
             rows = list(csv.DictReader(fh))
-        self.assertEqual([r["kind"] for r in rows], ["touch", "ball", "ball"], out)
+        self.assertEqual([r["kind"] for r in rows], ["touch", "ball", "ball", "ball"], out)   # the last one after the camera moved
         self.assertEqual(rows[2]["point"], "point 1")
         for r in rows:
-            self.assertLess(float(r["err_mm"]), 5.0, r)
-        self.assertEqual(len(list(cal.glob("check_sim1_*.png"))), 1)
+            self.assertLess(float(r["err_mm"]), 4.0, r)
+        self.assertEqual(len(list(out_dir.glob("check_sim1_*.png"))), 1)
 
-        # 7. the tracker itself, built the way real_tracking.py builds it, puts the ball where it is
-        world.ball = (0.40, -0.12)
-        trk, _ = real_intercept.make_tracker(calib, plane, hsv=((5, 120, 120), (25, 255, 255)))
-        det = trk.detect(cam2.read().img)
-        self.assertIsNotNone(det)
-        self.assertLess(np.linalg.norm(det.xy - (np.array(world.ball) + BIAS[:2])) * 1000, 4.0)
+        # ---- too few markers in view: refuse, with a reason
+        cam3 = sim_rig.FakeCamera(world, 640, 480)
+        cam3.set_pose((0.9, 0.0, 0.5), (0.30, 0.0, 0.0))
+        code, out = self.run_script("check_calibration", [], cam=cam3)
+        self.assertEqual(code, 1, out)
+        self.assertIn("CANNOT LOCATE THE CAMERA", out)
 
-        # 8. real_tracking.py still runs on the new files, and its pose watchdog notices a bumped camera
+        # ---- real_tracking.py locates the camera itself, its watchdog notices a bumped camera, c fixes it
         world.ball = (0.80, 0.05)
-        fast = lambda *a, **k: rc_PoseMonitor(*a, **{**k, "period": 0.05})
+        cam2.set_pose((1.55, 0.30, 0.95))
         rc_PoseMonitor = rc.PoseMonitor
+        fast = lambda *a, **k: rc_PoseMonitor(*a, **{**k, "period": 0.05})
         wait = [(None, lambda: time.sleep(0.03))] * 8
-        steps = wait + [(None, lambda: cam2.set_pose((1.55, 0.32, 0.95), (0.56, 0.0, 0.0)))] + wait * 2
+        steps = wait + [(None, lambda: cam2.set_pose((1.55, 0.32, 0.95), (0.56, 0.0, 0.0)))] + wait * 2 + [("c", None)] + wait * 2
         with mock.patch.object(rc, "PoseMonitor", fast):
             code, out = self.run_script("real_tracking", [], steps, cam=cam2)
         self.assertEqual(code, 0, out)
         self.assertIn("CAMERA MOVED", out)
+        self.assertEqual(out.count("camera located:"), 2)
 
 
 class GuidedCornersTest(unittest.TestCase):
@@ -200,19 +189,19 @@ class GuidedCornersTest(unittest.TestCase):
 
     def setUp(self):
         self.world = sim_rig.World()
-        self.map = rc.RigMap({k: P[:4] for k, P in self.world.truth.items()}, self.world.plane, rc.table_sizes())
+        self.map = rc.RigMap({k: P[:4] for k, P in self.world.truth.items()}, self.world.plane, dict(markers.SIZES))
         self.cam = sim_rig.FakeCamera(self.world, 640, 480)
-        self.cam.set_pose((1.55, 0.30, 0.95))             # orig:107 is too small here for the detector
+        self.cam.set_pose((1.55, 0.30, 0.95))             # 107 is too small here for the detector
 
     def truth_px(self, k):
         return rc.project(self.cam.K, self.cam.dist, self.cam.rvec, self.cam.tvec, self.world.truth[k][:4])
 
     def test_recovers_an_unread_marker(self):
         img = cv2.GaussianBlur(self.cam.read().img, (0, 0), 0.8)
-        plain = rc.detect_table(img)
-        self.assertNotIn("orig:107", plain)
+        plain = markers.detect(img)
+        self.assertNotIn("107", plain)
         found, guided = rc.detect_with_map(img, self.map, self.cam.K, self.cam.dist)       # pose from the other three
-        self.assertIn("orig:107", guided)
+        self.assertIn("107", guided)
         for k in guided:
             self.assertLess(np.abs(found[k] - self.truth_px(k)).max(), 0.6, k)
         res = rc.relocalize(self.map, self.cam.K, self.cam.dist, plain, guided={k: found[k] for k in guided},
@@ -223,7 +212,7 @@ class GuidedCornersTest(unittest.TestCase):
 
     def test_guided_markers_do_not_relax_the_rules(self):
         img = self.cam.read().img
-        plain = rc.detect_table(img)
+        plain = markers.detect(img)
         found, guided = rc.detect_with_map(img, self.map, self.cam.K, self.cam.dist)
         two = {k: plain[k] for k in sorted(plain)[:2]}
         with self.assertRaisesRegex(rc.CalibrationError, "need at least 3"):
@@ -231,7 +220,7 @@ class GuidedCornersTest(unittest.TestCase):
 
     def test_covered_marker_is_not_invented(self):
         img = self.cam.read().img
-        c = self.truth_px("orig:107").astype(np.int32)
+        c = self.truth_px("107").astype(np.int32)
         cv2.fillConvexPoly(img, cv2.convexHull(c + np.array([[-6, -6], [6, -6], [6, 6], [-6, 6]])), (120, 140, 170))   # a hand
         self.assertEqual(rc.detect_with_map(img, self.map, self.cam.K, self.cam.dist)[1], [])
 

@@ -114,7 +114,7 @@ class TopDown:
             col = YELLOW if k in rig_map.touched else GREY
             cv2.polylines(img, [pts.round().astype(np.int32)], True, col, 2, cv2.LINE_AA)
             cv2.circle(img, ipt(pts[0]), 4, col, -1)
-            put(img, k.split(":")[1], pts.mean(axis=0) + [-12, 5], col, 0.42)
+            put(img, k, pts.mean(axis=0) + [-12, 5], col, 0.42)
 
 
 def colorbar(img, vmax_mm: float, org=(0, 0), h=140):

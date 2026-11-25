@@ -15,8 +15,8 @@ from eaiproject.ball_intercept_env import jaw_rotation
 TEX = 2000.0                                   # texture pixels per metre
 X0, Y1 = -0.05, 0.50                           # texture origin: world (X0, Y1) is texture pixel (0, 0)
 TEX_W, TEX_H = int(1.15 * TEX), int(1.0 * TEX)
-LAYOUT = {"orig:107": (0.30, -0.21, 0.3), "orig:880": (0.33, 0.20, -1.2),      # near the arm
-          "orig:467": (0.72, -0.18, 2.0), "orig:718": (0.86, 0.16, 0.6)}       # mid-table
+LAYOUT = {"107": (0.30, -0.21, 0.3), "880": (0.33, 0.20, -1.2),      # near the arm
+          "467": (0.72, -0.18, 2.0), "718": (0.86, 0.16, 0.6)}       # mid-table
 
 
 def look_at(eye, target):
@@ -47,8 +47,7 @@ class World:
         self.truth = {k: rc.marker_points(self.plane, pose, markers.SIZES[k]) for k, pose in LAYOUT.items()}
         self.texture = np.full((TEX_H, TEX_W, 3), 205, np.uint8)
         for k, P in self.truth.items():
-            dname, mid = k.split(":")
-            m = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(markers.DICTS[dname]), int(mid), 280)
+            m = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(markers.DICT), int(k), 280)
             m = cv2.copyMakeBorder(m, 40, 40, 40, 40, cv2.BORDER_CONSTANT, value=255)           # quiet zone
             n = m.shape[0]
             src = np.float32([[39.5, 39.5], [n - 40.5, 39.5], [n - 40.5, n - 40.5], [39.5, n - 40.5]])

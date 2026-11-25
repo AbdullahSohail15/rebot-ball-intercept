@@ -1,30 +1,27 @@
-"""Capture the raw observations for the static rig calibration (eaiproject/rig_calib.py).
-
-Three modes, each saved to outputs/rig_calib/<session>/ so that the solve can be rerun offline and
-a mode can be resumed or repeated without redoing the others:
-
-    views   Move the camera to >= 5 different positions (angle and distance). At each one, with arm
-            and hands clear of the markers, SPACE averages every table-marker corner over 30 frames.
-            No arm needed.                                   keys: SPACE record, u undo, q quit
-    touch   Camera fixed anywhere that sees the markers. Guide the UNPOWERED arm by hand and rest
-            the CLOSED fingertips on the corner circled in yellow, SPACE. Corners go TL, TR, BR, BL
-            (OpenCV order; TL is the corner with the filled dot).
-                                keys: SPACE record, c record the marker CENTRE (optional), s skip corner,
-                                      n / p next / previous marker, u undo, q quit
-    sweep   Hold the gripper at the blocking tilt (~30 deg down, the window shows it) and slide the
-            closed fingertips slowly over the table while HOLDING SPACE. Samples are taken at ~50 Hz
-            only while the key is held (r toggles recording instead, if key repeat is off).
-            Cover the box around the intercept line (x = 0.40 m) well.
-                                keys: SPACE (hold) record, r toggle, u undo last stroke, l re-lock the
-                                      camera pose for the overlay, q quit
-
-Read-only on CAN (touch, sweep): RobStrideBus(movable=()) - nothing is ever enabled or moved.
+"""Static calibration of the rig, in one guided window: where the table markers and the table
+surface are in the arm's frame. Do it once; redo it only if a marker, the arm or the table moved.
 
     scripts/real/start_camera.sh --width 1280 --height 720 --fps 30
-    .venv/bin/python scripts/real/rig_capture.py views
-    .venv/bin/python scripts/real/rig_capture.py touch
-    .venv/bin/python scripts/real/rig_capture.py sweep
-    .venv/bin/python scripts/real/rig_solve.py
+    .venv/bin/python scripts/real/calibrate.py
+
+Three steps, then the solve. ENTER = next step, BACKSPACE = previous, 1 / 2 / 3 = jump to a step,
+q = quit. Everything is saved after every record (outputs/rig_calib/<session>/), so you can quit
+at any point and run the script again to continue where you stopped.
+
+  1 VIEWS   Move the camera to >= 5 different positions (angle and distance). At each one, with arm
+            and hands clear of the markers, SPACE averages every marker corner over 30 frames.
+            No arm needed.                                             SPACE record, u undo
+  2 TOUCH   Guide the UNPOWERED arm by hand and rest the CLOSED fingertips on the corner circled
+            in yellow, SPACE. Corners go TL, TR, BR, BL (TL has the filled dot).
+                        SPACE record, n / p next / previous marker, s skip corner, c centre, u undo
+  3 SWEEP   Hold the gripper at the blocking tilt (~30 deg down, the window shows it) and slide the
+            closed fingertips slowly over the table while HOLDING SPACE (r toggles recording
+            instead, if holding the key does not record).     u undo last stroke, l re-lock overlay
+  SOLVE     Fits everything, writes config/rig_map.json and a report, and shows the result.
+
+Read-only on CAN: RobStrideBus(movable=()) - nothing is ever enabled or moved.
+
+    .venv/bin/python scripts/real/calibrate.py --solve        # solve again from the saved data, no hardware
 """
 from __future__ import annotations
 
@@ -39,7 +36,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from eaiproject import markers  # noqa: E402
 from eaiproject import rig_calib as rc  # noqa: E402
+from eaiproject import rig_report  # noqa: E402
 from eaiproject.rig_draw import (GREEN, GREY, MAGENTA, RED, WHITE, YELLOW, TopDown, ipt, outline, put,  # noqa: E402
                                  window_closed)
 
@@ -68,10 +67,25 @@ def open_arm():
         return None
 
 
-def make_window(win: str, cam, extra_w: int = 0) -> None:
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    k = 2 if cam.width < 900 else 1
-    cv2.resizeWindow(win, cam.width * k + extra_w, cam.height * k)
+WIN = "rig calibration"
+NAV = "ENTER next step   BACKSPACE previous   1/2/3 jump   q quit (everything is saved)"
+
+
+def nav(key: int) -> str | None:
+    """Step navigation shared by all steps: where to go for this key, or None."""
+    if key == ord("q") or window_closed(WIN):
+        return "quit"
+    if key in (13, 10):
+        return "next"
+    if key in (8, 127):
+        return "prev"
+    return {ord("1"): "views", ord("2"): "touch", ord("3"): "sweep"}.get(key)
+
+
+def footer(img, msg: str = "") -> None:
+    if msg:
+        put(img, msg, (10, img.shape[0] - 34), RED, 0.5)
+    put(img, NAV, (10, img.shape[0] - 10), GREY, 0.45)
 
 
 def grab_average(cam, last_fn, n: int = 30, timeout: float = 4.0):
@@ -80,38 +94,39 @@ def grab_average(cam, last_fn, n: int = 30, timeout: float = 4.0):
     while len(frames) < n and time.monotonic() < t_end:
         g = cam.read(timeout=2.0, newer_than=fn)
         fn = g.frame_number
-        frames.append(rc.detect_table(g.img))
+        frames.append(markers.detect(g.img))
     mean, jitter = rc.average_corners(frames)
     return mean, jitter, len(frames), g
 
 
 # ----------------------------------------------------------------------------------- views
-def run_views(cam, sess: Path, n_frames: int) -> int:
+def run_views(cam, sess: Path, n_frames: int) -> str:
     path = sess / "views.json"
     views = json.loads(path.read_text())["views"] if path.exists() else []
-    win = "rig capture: VIEWS (SPACE record, u undo, q quit)"
-    make_window(win, cam)
     msg, last_fn = "", None
     while True:
         f = cam.read(timeout=2.0, newer_than=last_fn)
         last_fn = f.frame_number
         img = f.img.copy()
-        found = rc.detect_table(f.img)
+        found = markers.detect(f.img)
         for k, c in found.items():
             outline(img, c, GREEN, 2, k)
         n = len(views)
-        put(img, f"VIEWS {n} recorded (min {rc.MIN_VIEWS}, 6-8 is better). Arm + hands clear of the markers, camera still, SPACE",
+        put(img, f"1 VIEWS: {n} recorded (need {rc.MIN_VIEWS}, 6-8 is better). Hands + arm off the markers, camera still, SPACE",
             (10, 24), YELLOW if n < rc.MIN_VIEWS else GREEN)
-        put(img, f"table markers in view: {len(found)}  {sorted(found)}", (10, 48), GREEN if len(found) >= 3 else RED)
-        seen = {k: sum(k in v["corners"] for v in views) for k in rc.table_sizes()}
-        put(img, "views per marker: " + "  ".join(f"{k.split(':')[1]}:{c}" for k, c in seen.items()), (10, 72))
-        put(img, "vary the position: left / right / front, low (30 deg) to high (60 deg), near and far", (10, 96), WHITE, 0.45)
-        if msg:
-            put(img, msg, (10, img.shape[0] - 14), RED)
-        cv2.imshow(win, img)
+        put(img, f"markers in view: {len(found)}  {sorted(found)}", (10, 48), GREEN if len(found) >= 3 else RED)
+        seen = {k: sum(k in v["corners"] for v in views) for k in markers.SIZES}
+        put(img, "views per marker: " + "  ".join(f"{k}: {c}" for k, c in seen.items()), (10, 72))
+        put(img, "then move the camera: left / right / front, low (30 deg) to high (60 deg), near and far   (u = undo)",
+            (10, 96), WHITE, 0.45)
+        if cam.width < 1280:
+            put(img, f"camera is {cam.width}x{cam.height}: start it at 1280x720 for this calibration (more accurate)",
+                (10, 118), RED, 0.45)
+        footer(img, msg)
+        cv2.imshow(WIN, img)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or window_closed(win):
-            break
+        if nav(key):
+            return nav(key)
         if key == ord("u") and views:
             v = views.pop()
             path.write_text(json.dumps({"views": views}, indent=1))
@@ -134,8 +149,6 @@ def run_views(cam, sess: Path, n_frames: int) -> int:
             path.write_text(json.dumps({"views": views}, indent=1))
             msg = ""
             print(f"{name}: {sorted(mean)}  jitter max {max(jitter.values()):.2f} px", flush=True)
-    print(f"{len(views)} views in {path}")
-    return 0 if len(views) >= rc.MIN_VIEWS else 1
 
 
 # ----------------------------------------------------------------------------------- touch
@@ -155,12 +168,10 @@ def touch_sanity(touches: list, new: dict, size: float) -> str:
     return ("CHECK: " + "; ".join(out) + "  (u = undo)") if out else ""
 
 
-def run_touch(cam, arm, sess: Path) -> int:
+def run_touch(cam, arm, sess: Path) -> str:
     path = sess / "touches.json"
     touches = json.loads(path.read_text())["touches"] if path.exists() else []
-    sizes = rc.table_sizes()
-    win = "rig capture: TOUCH (SPACE record, c centre, s skip corner, n/p marker, u undo, q quit)"
-    make_window(win, cam)
+    sizes = markers.SIZES
     seen: dict[str, np.ndarray] = {}                # last known corners (the hand hides markers while touching)
     cur, skipped, msg, last_fn = None, set(), "", None
 
@@ -177,7 +188,7 @@ def run_touch(cam, arm, sess: Path) -> int:
         f = cam.read(timeout=2.0, newer_than=last_fn)
         last_fn = f.frame_number
         img = f.img.copy()
-        for k, c in rc.detect_table(f.img).items():
+        for k, c in markers.detect(f.img).items():
             near = k in seen and np.abs(seen[k] - c).max() < 3.0
             seen[k] = 0.7 * seen[k] + 0.3 * c if near else c
         keys = sorted(seen)
@@ -201,32 +212,32 @@ def run_touch(cam, arm, sess: Path) -> int:
             cv2.circle(img, ipt(tgt), 16, YELLOW, 2, cv2.LINE_AA)
             cv2.drawMarker(img, ipt(tgt), YELLOW, cv2.MARKER_CROSS, 44, 1, cv2.LINE_AA)
             put(img, f"touch here: {rc.CORNER_NAMES[cc]}", tgt + [20, -14], YELLOW, 0.6, 2)
-            put(img, f"TOUCH: closed fingertips on corner {rc.CORNER_NAMES[cc]} of {cur}, hold still, SPACE", (10, 24), YELLOW)
+            put(img, f"2 TOUCH: closed fingertips on corner {rc.CORNER_NAMES[cc]} of marker {cur}, hold still, SPACE", (10, 24), YELLOW)
         elif cur:
-            put(img, f"{cur}: corners done. n = next marker, c = centre (optional), q = finish", (10, 24), GREEN)
+            put(img, f"2 TOUCH: marker {cur} done. n = next marker you can reach (p = previous), ENTER when finished", (10, 24), GREEN)
         else:
-            put(img, "no table marker seen yet: aim the camera at the markers", (10, 24), RED)
+            put(img, "2 TOUCH: no marker seen yet: aim the camera at the markers", (10, 24), RED)
         y = 50
         for k in keys:
             d = done(k)
             txt = " ".join(n if i in d else "--" for i, n in enumerate(rc.CORNER_NAMES))
-            put(img, f"{'>' if k == cur else ' '} {k:9s} {txt}", (10, y), YELLOW if k == cur else (GREEN if len(d) >= 4 else WHITE), 0.45)
+            put(img, f"{'>' if k == cur else ' '} {k:4s} {txt}", (10, y), YELLOW if k == cur else (GREEN if len(d) >= 4 else WHITE), 0.45)
             y += 20
         n_mk = sum(1 for k in keys if len(done(k) - {rc.CENTRE}) >= 2)
-        put(img, f"{len(touches)} touches on {n_mk} marker(s); touch every corner of every marker you can reach (>= 2 markers)",
+        put(img, f"{len(touches)} touches on {n_mk} marker(s). All 4 corners of every marker within reach, at least 2 markers",
             (10, y + 4), GREEN if n_mk >= 2 else WHITE, 0.45)
+        put(img, "s = skip this corner   c = record the marker centre (optional)   u = undo", (10, y + 24), GREY, 0.42)
         if s is not None:
             put(img, f"fingertip x {s.p[0] * 100:6.1f}  y {s.p[1] * 100:+6.1f} cm  z {s.p[2] * 1000:6.1f} mm",
-                (10, img.shape[0] - 36))
+                (10, img.shape[0] - 58))
         else:
-            put(img, "no joint readings", (10, img.shape[0] - 36), RED)
-        if msg:
-            put(img, msg, (10, img.shape[0] - 12), RED)
-        cv2.imshow(win, img)
+            put(img, "no joint readings", (10, img.shape[0] - 58), RED)
+        footer(img, msg)
+        cv2.imshow(WIN, img)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or window_closed(win):
-            break
-        if key in (ord("n"), 9, ord("p")) and keys:
+        if nav(key):
+            return nav(key)
+        if key in (ord("n"), ord("p")) and keys:
             cur = keys[(keys.index(cur) + (-1 if key == ord("p") else 1)) % len(keys)]
             msg = ""
         if key == ord("s") and cur and cc is not None:
@@ -242,7 +253,7 @@ def run_touch(cam, arm, sess: Path) -> int:
             corner = rc.CENTRE if key == ord("c") else cc
             st = arm.steady()
             if corner is None:
-                msg = "all 4 corners of this marker are done (n = next marker)"
+                msg = "all 4 corners of this marker are done: n = next marker, ENTER = next step"
             elif st is None:
                 msg = "no joint readings"
             elif st[1] * 1000 > STILL_MM:
@@ -255,9 +266,6 @@ def run_touch(cam, arm, sess: Path) -> int:
                 save()
                 print(f"touch {cur} {rc.CORNER_NAMES[corner]}: ({st[0].p[0]:.4f}, {st[0].p[1]:+.4f}, {st[0].p[2]:.4f}) m  {msg}",
                       flush=True)
-    n_mk = len({t["key"] for t in touches})
-    print(f"{len(touches)} touches on {n_mk} markers in {path}")
-    return 0 if n_mk >= 2 else 1
 
 
 # ----------------------------------------------------------------------------------- sweep
@@ -279,15 +287,13 @@ def provisional_pose(cam, last_fn, sess: Path):
         return None, str(e), g.frame_number
 
 
-def run_sweep(cam, arm, sess: Path, ref_tilt: float, max_dev: float) -> int:
+def run_sweep(cam, arm, sess: Path, ref_tilt: float, max_dev: float) -> str:
     path = sess / "sweep.npz"
     strokes: list[list] = []                       # each stroke: list of ArmSample-like tuples (t, q, p, R)
     if path.exists():
         z = np.load(path)
         strokes.append([(t, q, p, R) for t, q, p, R in zip(z["t"], z["q"], z["p"], z["R"])])
     top = TopDown(x=(0.10, 0.75), y=(-0.40, 0.40), scale=600.0)
-    win = "rig capture: SWEEP (hold SPACE to record, r toggle, u undo stroke, l lock pose, q quit)"
-    make_window(win, cam, top.w)
     pose, pose_src, last_fn = provisional_pose(cam, None, sess)
     msg = "" if pose else f"no camera pose for the image overlay ({pose_src}); use the top view on the right"
     toggled, t_key, t_commit, stroke_open = False, -1e9, None, False
@@ -362,22 +368,25 @@ def run_sweep(cam, arm, sess: Path, ref_tilt: float, max_dev: float) -> int:
                      f"z {s.p[2] * 1000:5.1f} mm", (10, 50), GREEN if good else RED, 0.6, 2 if not good else 1)
         else:
             put(img, "no joint readings", (10, 50), RED)
-        put(img, ("RECORDING" if holding else "hold SPACE and slide the closed fingertips over the table"),
+        put(img, ("3 SWEEP: RECORDING" if holding else "3 SWEEP: hold SPACE and slide the closed fingertips over the table"),
             (10, 24), RED if holding else YELLOW, 0.65, 2 if holding else 1)
         put(img, f"{len(allp)} samples ({int(ok.sum())} at the right tilt)   {len(cells)} cells   "
                  f"box around the intercept line: {100 * cover:.0f} % covered (aim >= 70 %)",
             (10, 76), GREEN if cover >= 0.7 else WHITE, 0.5)
         if pose is not None:
             put(img, f"overlay pose from {pose_src} (l = re-lock with hands away)", (10, 98), GREY, 0.42)
-        if msg:
-            put(img, msg, (10, img.shape[0] - 12), RED, 0.5)
+        put(img, "r = recording on/off without holding   u = undo the last stroke", (10, 118), GREY, 0.42)
+        footer(img, msg)
         h = img.shape[0]
         tv = cv2.resize(tv, (int(tv.shape[1] * h / tv.shape[0]), h))
-        cv2.imshow(win, np.hstack([img, tv]))
+        cv2.imshow(WIN, np.hstack([img, tv]))
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord("q") or window_closed(win):
-            break
+        if nav(key) and not holding:
+            if stroke_open and not strokes[-1]:
+                strokes.pop()
+            save()
+            return nav(key)
         if key == ord(" ") and not toggled:
             tk = time.monotonic()
             if not stroke_open:
@@ -401,45 +410,116 @@ def run_sweep(cam, arm, sess: Path, ref_tilt: float, max_dev: float) -> int:
         if key == ord("l") and not holding:
             pose, pose_src, last_fn = provisional_pose(cam, last_fn, sess)
             msg = "" if pose else f"no camera pose: {pose_src}"
-    if stroke_open and not strokes[-1]:
-        strokes.pop()
-    save()
-    pts, st = rc.filter_sweep(allp, allR, ref_tilt, max_dev, GRID) if len(allp) else (np.zeros((0, 3)), {})
-    print(f"sweep: {st}  target box {100 * cover:.0f} % covered  -> {path}")
-    return 0 if len(pts) >= 30 else 1
+
+
+# ----------------------------------------------------------------------------------- solve
+def solve(sess: Path, args) -> tuple[rc.RigSolution | None, str]:
+    """Solve from the saved observations; write the report and config/rig_map.json."""
+    ref = None if args.ref_tilt == "median" else float(args.ref_tilt)
+    obs, sweep_stats = rc.load_observations(sess, ref, args.max_dev)
+    obs.sources["session"] = str(sess.relative_to(ROOT)) if sess.is_relative_to(ROOT) else str(sess)
+    try:
+        sol = rc.solve_rig(obs, far_dist=args.far_dist)
+    except rc.CalibrationError as e:
+        return None, f"CANNOT SOLVE: {e}"
+    if sweep_stats.get("n_raw") and sweep_stats["n_tilt_rejected"] > 0.5 * sweep_stats["n_raw"]:
+        sol.warnings.append(f"{sweep_stats['n_tilt_rejected']} of {sweep_stats['n_raw']} sweep samples were more than "
+                            f"{args.max_dev:.0f} deg from the {sweep_stats['ref_tilt_deg']:.0f} deg tilt and are not used "
+                            "(--ref-tilt median uses the tilt that was actually held)")
+    out, text = rig_report.save_report(sol, obs, sweep_stats, sess)
+    sol.rig_map.save(rc.MAP_PATH)
+    text += f"\n\nreport: {out}\nwrote {rc.MAP_PATH}  (commit it)\nnext: scripts/real/check_calibration.py"
+    return sol, text
+
+
+def show_result(sess: Path, sol, text: str) -> str:
+    """The solve result in the window: the layout picture, the headline numbers and the warnings."""
+    if sol is None:
+        img = np.full((720, 1280, 3), 32, np.uint8)
+        put(img, text[:150], (20, 60), RED, 0.6)
+        lines = [text[150:300]]
+    else:
+        img = cv2.imread(str(sess / "report" / "layout.png"))
+        r = sol.report
+        ok = not sol.warnings
+        put(img, "CALIBRATION OK - config/rig_map.json written" if ok else "MAP WRITTEN, BUT CHECK THE WARNINGS",
+            (20, 70), GREEN if ok else YELLOW, 0.8, 2)
+        lines = [f"reprojection {r['reproj_rms_px']} px (< {rc.OK_PX})   touches {r['touch_rms_mm']} mm (< {rc.OK_MM})   "
+                 f"sweep {r['sweep_rms_mm']} mm (< 1.5)"] + [f"! {w}" for w in sol.warnings]
+    y = 100
+    for line in lines:
+        for k in range(0, len(line), 125):                  # wrap long warnings
+            put(img, line[k:k + 125], (20, y), WHITE if not line.startswith("!") else YELLOW, 0.45)
+            y += 20
+    put(img, f"full report: {sess / 'report' / 'report.txt'}", (60, img.shape[0] - 64), GREY, 0.45)
+    put(img, "BACKSPACE or 1 / 2 / 3 = go back and fix      ENTER or q = done", (60, img.shape[0] - 42), WHITE, 0.5)
+    while True:
+        cv2.imshow(WIN, img)
+        go = nav(cv2.waitKey(30) & 0xFF)
+        if go:
+            return "quit" if go == "next" else go
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["views", "touch", "sweep"])
-    ap.add_argument("--session", default=time.strftime("%Y%m%d"), help="folder under outputs/rig_calib/ (default: today)")
+    ap.add_argument("--session", help="folder under outputs/rig_calib/ (default: today; with --solve: the newest)")
+    ap.add_argument("--solve", action="store_true", help="only solve from the saved observations (no camera, no arm)")
     ap.add_argument("--frames", type=int, default=30, help="frames averaged per view")
-    ap.add_argument("--ref-tilt", type=float, default=rc.BLOCK_TILT_DEG, help="blocking tilt of the gripper, deg")
+    ap.add_argument("--ref-tilt", default=str(rc.BLOCK_TILT_DEG),
+                    help="blocking tilt of the gripper in deg, or 'median' = the tilt actually held in the sweep")
     ap.add_argument("--max-dev", type=float, default=5.0, help="sweep: allowed orientation deviation, deg")
+    ap.add_argument("--far-dist", type=float, default=rc.FAR_DIST,
+                    help="markers farther than this from the base count as 'far' when locating the camera (m)")
     args = ap.parse_args()
-    sess = rc.SESSIONS_DIR / args.session
+    if args.solve:
+        sess = rc.SESSIONS_DIR / args.session if args.session else rc.latest_session()
+        if sess is None or not sess.exists():
+            print(f"no saved session under {rc.SESSIONS_DIR}")
+            return 2
+        sol, text = solve(sess, args)
+        print(text)
+        return 0 if sol is not None else 1
+
+    sess = rc.SESSIONS_DIR / (args.session or time.strftime("%Y%m%d"))
     sess.mkdir(parents=True, exist_ok=True)
     cam = open_camera()
     if cam is None:
         return 2
-    arm = None
-    if args.mode != "views":
-        arm = open_arm()
-        if arm is None:
-            cam.close()
-            return 2
     print(f"session: {sess}")
+    tilt = rc.BLOCK_TILT_DEG if args.ref_tilt == "median" else float(args.ref_tilt)
+    n_views = len(json.loads((sess / "views.json").read_text())["views"]) if (sess / "views.json").exists() else 0
+    step = "views" if n_views < rc.MIN_VIEWS else "touch" if not (sess / "touches.json").exists() else "sweep"
+    order = ["views", "touch", "sweep", "solve"]
+    arm, code = None, 0
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, 1280, 720)
     try:
-        if args.mode == "views":
-            return run_views(cam, sess, args.frames)
-        if args.mode == "touch":
-            return run_touch(cam, arm, sess)
-        return run_sweep(cam, arm, sess, args.ref_tilt, args.max_dev)
+        while step != "quit":
+            if step in ("touch", "sweep") and arm is None:
+                arm = open_arm()
+                if arm is None:
+                    print("Steps 2 and 3 need the arm on CAN (powered, not enabled). The views are saved; run this again.")
+                    code = 2
+                    break
+            if step == "views":
+                go = run_views(cam, sess, args.frames)
+            elif step == "touch":
+                go = run_touch(cam, arm, sess)
+            elif step == "sweep":
+                go = run_sweep(cam, arm, sess, tilt, args.max_dev)
+            else:
+                sol, text = solve(sess, args)
+                print("\n" + text, flush=True)
+                code = 0 if sol is not None else 1
+                go = show_result(sess, sol, text)
+            i = order.index(step)
+            step = go if go in order or go == "quit" else order[min(i + 1, 3)] if go == "next" else order[max(i - 1, 0)]
     finally:
         cv2.destroyAllWindows()
         cam.close()
         if arm is not None:
             arm.close()
+    return code
 
 
 if __name__ == "__main__":
